@@ -1,0 +1,72 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Dataset contents and generated metadata
+data/paired/
+data/cache/
+data/manifests/
+data/quality/
+data/splits/
+dataset/
+datasets/
+
+# Model weights and exports
+weights/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# Training and inference outputs
+runs/
+outputs/
+results/
+logs/
+tensorboard/
+wandb/
+*.log
+
+# Packaging/build output
+build/
+dist/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Operating system
+.DS_Store
+Thumbs.db
+desktop.ini

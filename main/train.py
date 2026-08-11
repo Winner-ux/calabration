@@ -1,0 +1,351 @@
+"""基于正式 manifest/split 的最小 IR/RGB 融合训练入口。"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from data_pipeline.schema import (
+    SAMPLE_FIELDS,
+    SPLIT_SCHEMA_VERSION,
+    DataContractError,
+    canonical_rows_hash,
+    load_dataset_config,
+    read_csv_rows,
+)
+from data_pipeline.sampling import build_train_sampler
+from data_pipeline.transforms import build_paired_transform, build_rgb_transform
+from dataset import PairedFusionDataset
+from loss import FusionLoss
+from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DataContractError(f"无法读取 JSON {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise DataContractError(f"JSON 根节点必须是对象: {path}")
+    return value
+
+
+def validate_training_inputs(
+    data_root: Path,
+    config: dict[str, Any],
+    split_version: str,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """拒绝未经完整审计或与 manifest 不一致的 split。"""
+    manifest_dir = data_root / str(config["paths"]["manifests"])
+    samples_path = manifest_dir / "samples.csv"
+    samples = read_csv_rows(samples_path, SAMPLE_FIELDS)
+    split_dir = data_root / str(config["paths"]["splits"]) / split_version
+    split_config = _load_json(split_dir / "split_config.json")
+    audit = _load_json(split_dir / "audit.json")
+    expected_hash = canonical_rows_hash(samples, SAMPLE_FIELDS)
+    if split_config.get("dataset_manifest_sha256") != expected_hash:
+        raise DataContractError("split_config 的 manifest 哈希与当前 samples.csv 不一致")
+    if audit.get("dataset_manifest_sha256") != expected_hash:
+        raise DataContractError("audit.json 的 manifest 哈希与当前 samples.csv 不一致")
+    if not split_config.get("formal", False):
+        raise DataContractError("训练入口只接受 formal split")
+    if int(split_config.get("split_schema_version", -1)) != SPLIT_SCHEMA_VERSION:
+        raise DataContractError(
+            f"训练入口只接受 split schema v{SPLIT_SCHEMA_VERSION}"
+        )
+    if split_config.get("algorithm") != config["splitting"]["algorithm"]:
+        raise DataContractError("split 算法与当前 dataset.yaml 不一致")
+    if audit.get("audit_level") != "full":
+        raise DataContractError("请先运行 scripts/audit_dataset.py 完成 full audit")
+    if int(audit.get("fatal_count", -1)) != 0 or not audit.get("formal_ready", False):
+        raise DataContractError(f"数据审计未通过: {audit.get('fatals', audit.get('failures'))}")
+    for filename in (
+        "group_assignments.csv",
+        "experiment_assignments.csv",
+        "train_pool.csv",
+        "train.csv",
+        "val.csv",
+        "test.csv",
+    ):
+        if not (split_dir / filename).is_file():
+            raise DataContractError(f"split 缺少 {filename}: {split_dir}")
+    return samples_path, split_dir, split_config
+
+
+def _split_manifests_hash(split_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for filename in (
+        "group_assignments.csv",
+        "experiment_assignments.csv",
+        "train_pool.csv",
+        "train.csv",
+        "val.csv",
+        "test.csv",
+    ):
+        path = split_dir / filename
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _build_dataset(
+    data_root: Path,
+    samples_path: Path,
+    split_dir: Path,
+    split: str,
+    config_path: Path,
+    config: dict[str, Any],
+    seed: int,
+) -> PairedFusionDataset:
+    return PairedFusionDataset(
+        data_root=data_root,
+        samples_manifest=samples_path,
+        split_manifest=split_dir / f"{split}.csv",
+        paired_transform=build_paired_transform(config, split),
+        rgb_transform=build_rgb_transform(config, split),
+        ir_conversion="bt601",
+        config_path=config_path,
+        base_seed=seed,
+    )
+
+
+def _make_run_directory(output_root: Path, smoke_only: bool) -> Path:
+    prefix = "smoke" if smoke_only else "train"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    run_dir = output_root / f"{prefix}-{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _append_log(path: Path, row: dict[str, Any]) -> None:
+    exists = path.exists()
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _validate_epoch(
+    model: torch.nn.Module,
+    criterion: FusionLoss,
+    loader: DataLoader,
+    device: torch.device,
+    amp_enabled: bool,
+) -> float:
+    model.eval()
+    total = 0.0
+    count = 0
+    with torch.inference_mode():
+        for batch in loader:
+            vis = batch["vis"].to(device, non_blocking=True)
+            ir = batch["ir"].to(device, non_blocking=True)
+            with torch.amp.autocast(device.type, enabled=amp_enabled):
+                fused = model(vis, ir)
+                loss, _ = criterion(fused, ir, vis)
+            total += float(loss.detach()) * vis.shape[0]
+            count += vis.shape[0]
+    if count == 0:
+        raise DataContractError("validation DataLoader 为空")
+    return total / count
+
+
+def run_training(args: argparse.Namespace) -> Path:
+    data_root = args.data_root.resolve()
+    config_path = args.config.resolve()
+    config = load_dataset_config(config_path)
+    seed = int(args.seed if args.seed is not None else config["training"]["seed"])
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    samples_path, split_dir, split_config = validate_training_inputs(
+        data_root, config, args.split_version
+    )
+    train_dataset = _build_dataset(
+        data_root, samples_path, split_dir, "train", config_path, config, seed
+    )
+    val_dataset = _build_dataset(
+        data_root, samples_path, split_dir, "val", config_path, config, seed
+    )
+    batch_size = int(args.batch_size or config["training"]["batch_size"])
+    workers = int(args.num_workers if args.num_workers is not None else config["training"]["num_workers"])
+    if batch_size <= 0 or workers < 0:
+        raise DataContractError("batch_size 必须为正，num_workers 不能为负")
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    pin_memory = device.type == "cuda"
+    train_sampler = build_train_sampler(train_dataset, config, seed=seed)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=False,
+    )
+    model = ResNetFusion(Residual, DecoderBlock, FusionBlock, CrossAttention).to(device)
+    criterion = FusionLoss().to(device)
+    learning_rate = float(args.learning_rate or config["training"]["learning_rate"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    amp_enabled = bool(config["training"].get("amp", True)) and device.type == "cuda" and not args.no_amp
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    epochs = int(args.epochs or config["training"]["epochs"])
+    max_steps = 1 if args.smoke_only and args.max_steps is None else args.max_steps
+    if args.smoke_only and max_steps != 1:
+        raise DataContractError("--smoke-only 只允许 --max-steps 1")
+    split_manifest_hash = _split_manifests_hash(split_dir)
+    run_metadata = {
+        "smoke_only": bool(args.smoke_only),
+        "split_version": args.split_version,
+        "split_schema_version": int(split_config["split_schema_version"]),
+        "split_manifest_sha256": split_manifest_hash,
+        "seed": seed,
+        "sampler": str(config["training"]["sampler"]),
+        "device": str(device),
+        "amp": amp_enabled,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+    }
+    start_epoch = 0
+    best_val = float("inf")
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        checkpoint_config = checkpoint.get("run_config", {})
+        for key in ("split_version", "split_schema_version", "split_manifest_sha256", "seed", "sampler"):
+            if checkpoint_config.get(key) != run_metadata[key]:
+                raise DataContractError(
+                    f"checkpoint 的 {key} 与当前训练配置不一致: "
+                    f"checkpoint={checkpoint_config.get(key)!r}, current={run_metadata[key]!r}"
+                )
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scaler.load_state_dict(checkpoint.get("scaler", {}))
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best_val = float(checkpoint.get("best_val", best_val))
+
+    run_dir = _make_run_directory(args.output_root.resolve(), args.smoke_only)
+    (run_dir / "run_config.json").write_text(
+        json.dumps(run_metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    global_steps = 0
+    for epoch in range(start_epoch, epochs):
+        train_dataset.set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
+        model.train()
+        epoch_total = 0.0
+        epoch_count = 0
+        for batch in train_loader:
+            vis = batch["vis"].to(device, non_blocking=True)
+            ir = batch["ir"].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device.type, enabled=amp_enabled):
+                fused = model(vis, ir)
+                loss, _ = criterion(fused, ir, vis)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"训练 loss 非有限值: {float(loss.detach())}")
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_total += float(loss.detach()) * vis.shape[0]
+            epoch_count += vis.shape[0]
+            global_steps += 1
+            if max_steps is not None and global_steps >= max_steps:
+                break
+        if epoch_count == 0:
+            raise DataContractError("training DataLoader 为空")
+        train_loss = epoch_total / epoch_count
+        if args.smoke_only:
+            result = {
+                **run_metadata,
+                "steps": global_steps,
+                "train_loss": train_loss,
+                "output_shape": list(fused.shape),
+            }
+            (run_dir / "smoke_result.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return run_dir
+
+        val_loss = _validate_epoch(model, criterion, val_loader, device, amp_enabled)
+        log_row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
+        _append_log(run_dir / "metrics.csv", log_row)
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "best_val": min(best_val, val_loss),
+            "run_config": run_metadata,
+        }
+        torch.save(checkpoint, run_dir / "last.pt")
+        if val_loss < best_val:
+            best_val = val_loss
+            checkpoint["best_val"] = best_val
+            torch.save(checkpoint, run_dir / "best.pt")
+        print(json.dumps(log_row, ensure_ascii=False))
+        if max_steps is not None and global_steps >= max_steps:
+            break
+    return run_dir
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "data" / "dataset.yaml")
+    parser.add_argument("--split-version", required=True)
+    parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "runs")
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--device")
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--max-steps", type=int)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    output = run_training(args)
+    print(f"run_dir={output}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (DataContractError, FileNotFoundError, FileExistsError, FloatingPointError) as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(2)
