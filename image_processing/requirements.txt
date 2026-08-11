@@ -1,0 +1,5 @@
+numpy>=2.0,<3
+opencv-python>=4.10
+PyYAML>=6.0
+Pillow>=10.0
+imageio-ffmpeg>=0.5
