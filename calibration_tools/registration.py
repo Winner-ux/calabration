@@ -29,8 +29,8 @@ def ensure_3ch(image):
     return image
 
 
-def load_calibration():
-    path = CALIBRATION_MODEL_PATH
+def load_calibration(model_path=CALIBRATION_MODEL_PATH):
+    path = model_path
     if not os.path.exists(path):
         return np.eye(3, dtype=np.float64), {"source": "identity_fallback"}
     with open(path, "r", encoding="utf-8") as stream:
