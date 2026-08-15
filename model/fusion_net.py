@@ -174,7 +174,7 @@ class ResNetFusion(nn.Module):
         model = ResNetFusion(Residual, DecoderBlock, FusionBlock, CrossAttention)
         fused = model(vis_image, ir_image)
     """
-    def __init__(self, Residual, DecoderBlock, FusionBlock, CrossAttention):
+    def __init__(self, Residual, DecoderBlock, FusionBlock, CrossAttention, ir_mode="gray"):
         super(ResNetFusion, self).__init__()
 
         # ==================================================
@@ -185,7 +185,8 @@ class ResNetFusion(nn.Module):
         # 权重不共享 (因为 VIS 和 IR 的统计特性差异很大)
         # ==================================================
         self.vis_encoder = VIS_Encoder(Residual)
-        self.ir_encoder  = IR_Encoder(Residual)
+        self.ir_mode = ir_mode
+        self.ir_encoder  = IR_Encoder(Residual, ir_mode=ir_mode)
 
         # ==================================================
         # 融合网络: 在 5 个层级将 VIS 和 IR 特征融合

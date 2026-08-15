@@ -78,6 +78,7 @@ audit:
   phash_size: 8
   phash_high_frequency_factor: 4
   near_duplicate_hamming_threshold: 5
+  near_duplicate_top_k_per_sample: 5
   registration_resize_width: 256
   registration_review_threshold: 0.10
 

@@ -6,7 +6,11 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import random
+import shutil
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,12 +29,57 @@ from data_pipeline.schema import (
 )
 from data_pipeline.sampling import build_train_sampler
 from data_pipeline.transforms import build_paired_transform, build_rgb_transform
-from dataset import PairedFusionDataset
-from loss import FusionLoss
-from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
+from .dataset import PairedFusionDataset
+from .inference_utils import load_initial_model_checkpoint, sha256_file
+from .loss import FusionLoss
+from model import IR_MODES, CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LOSS_WEIGHTS = {
+    "intensity": 1.0,
+    "gradient": 10.0,
+    "ssim": 5.0,
+    "edge": 2.0,
+}
+
+
+def _loss_weights_from_args(args: argparse.Namespace) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for name, default in DEFAULT_LOSS_WEIGHTS.items():
+        raw = getattr(args, f"lambda_{name}", None)
+        weights[name] = float(default if raw is None else raw)
+    for name, value in weights.items():
+        if not math.isfinite(value) or value < 0:
+            raise DataContractError(f"lambda_{name} 必须是有限非负数，实际为 {value!r}")
+    if not any(value > 0 for value in weights.values()):
+        raise DataContractError("损失权重不能全部为 0")
+    if not math.isclose(sum(weights.values()), 18.0, rel_tol=0.0, abs_tol=1e-6):
+        raise DataContractError(
+            f"本轮权重消融要求四项权重之和为 18，实际为 {sum(weights.values()):.8g}"
+        )
+    return weights
+
+
+def _checkpoint_loss_weights(config: dict[str, Any]) -> dict[str, float]:
+    raw = config.get("loss_weights", DEFAULT_LOSS_WEIGHTS)
+    if not isinstance(raw, dict):
+        raise DataContractError("checkpoint loss_weights 必须是对象")
+    try:
+        return {name: float(raw[name]) for name in DEFAULT_LOSS_WEIGHTS}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataContractError(f"checkpoint loss_weights 非法: {raw!r}") from exc
+
+
+def _validate_checkpoint_loss_weights(
+    config: dict[str, Any], current: dict[str, float]
+) -> None:
+    checkpoint_weights = _checkpoint_loss_weights(config)
+    if checkpoint_weights != current:
+        raise DataContractError(
+            "checkpoint 的 loss_weights 与当前训练配置不一致: "
+            f"checkpoint={checkpoint_weights!r}, current={current!r}"
+        )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -148,9 +197,15 @@ def _validate_epoch(
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
-) -> float:
+) -> dict[str, float]:
     model.eval()
-    total = 0.0
+    totals = {
+        "loss": 0.0,
+        "intensity_loss": 0.0,
+        "gradient_loss": 0.0,
+        "ssim_loss": 0.0,
+        "edge_loss": 0.0,
+    }
     count = 0
     with torch.inference_mode():
         for batch in loader:
@@ -158,18 +213,51 @@ def _validate_epoch(
             ir = batch["ir"].to(device, non_blocking=True)
             with torch.amp.autocast(device.type, enabled=amp_enabled):
                 fused = model(vis, ir)
-                loss, _ = criterion(fused, ir, vis)
-            total += float(loss.detach()) * vis.shape[0]
+            loss, components = criterion(fused.float(), ir.float(), vis.float())
+            batch_size = vis.shape[0]
+            totals["loss"] += float(loss.detach()) * batch_size
+            for name in components:
+                totals[name] += float(components[name]) * batch_size
             count += vis.shape[0]
     if count == 0:
         raise DataContractError("validation DataLoader 为空")
-    return total / count
+    return {name: value / count for name, value in totals.items()}
+
+
+def _runtime_metadata(device: torch.device) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "torch": str(torch.__version__),
+        "cuda_build": torch.version.cuda,
+    }
+    if device.type == "cuda":
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(index)
+        metadata.update(
+            {
+                "gpu": properties.name,
+                "gpu_total_memory_bytes": int(properties.total_memory),
+            }
+        )
+    return metadata
 
 
 def run_training(args: argparse.Namespace) -> Path:
     data_root = args.data_root.resolve()
     config_path = args.config.resolve()
     config = load_dataset_config(config_path)
+    loss_weights = _loss_weights_from_args(args)
+    ir_mode = str(getattr(args, "ir_mode", "gray"))
+    if ir_mode not in IR_MODES:
+        raise DataContractError(f"非法 ir_mode: {ir_mode!r}")
+    resume = getattr(args, "resume", None)
+    init_checkpoint = getattr(args, "init_checkpoint", None)
+    if resume is not None and init_checkpoint is not None:
+        raise DataContractError("--resume 与 --init-checkpoint 不能同时使用")
+    if getattr(args, "best_checkpoint", None) and resume is None:
+        raise DataContractError("--best-checkpoint 只能与 --resume 一起使用")
+    if getattr(args, "reset_optimizer", False) and resume is None:
+        raise DataContractError("--reset-optimizer 只能与 --resume 一起使用")
     seed = int(args.seed if args.seed is not None else config["training"]["seed"])
     random.seed(seed)
     np.random.seed(seed)
@@ -199,7 +287,7 @@ def run_training(args: argparse.Namespace) -> Path:
         sampler=train_sampler,
         num_workers=workers,
         pin_memory=pin_memory,
-        persistent_workers=False,
+        persistent_workers=workers > 0,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -207,10 +295,22 @@ def run_training(args: argparse.Namespace) -> Path:
         shuffle=False,
         num_workers=workers,
         pin_memory=pin_memory,
-        persistent_workers=False,
+        persistent_workers=workers > 0,
     )
-    model = ResNetFusion(Residual, DecoderBlock, FusionBlock, CrossAttention).to(device)
-    criterion = FusionLoss().to(device)
+    model = ResNetFusion(
+        Residual, DecoderBlock, FusionBlock, CrossAttention, ir_mode=ir_mode
+    ).to(device)
+    initialization = None
+    if init_checkpoint is not None:
+        initialization = load_initial_model_checkpoint(
+            model, init_checkpoint, ir_mode=ir_mode
+        )
+    criterion = FusionLoss(
+        lambda_intensity=loss_weights["intensity"],
+        lambda_gradient=loss_weights["gradient"],
+        lambda_ssim=loss_weights["ssim"],
+        lambda_edge=loss_weights["edge"],
+    ).to(device)
     learning_rate = float(args.learning_rate or config["training"]["learning_rate"])
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     amp_enabled = bool(config["training"].get("amp", True)) and device.type == "cuda" and not args.no_amp
@@ -231,11 +331,18 @@ def run_training(args: argparse.Namespace) -> Path:
         "amp": amp_enabled,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
+        "num_workers": workers,
+        "epochs": epochs,
+        "ir_mode": ir_mode,
+        "loss_weights": loss_weights,
+        "initialization": initialization,
+        "reset_optimizer": bool(getattr(args, "reset_optimizer", False)),
+        "runtime": _runtime_metadata(device),
     }
     start_epoch = 0
     best_val = float("inf")
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+    if resume:
+        checkpoint = torch.load(resume, map_location=device, weights_only=False)
         checkpoint_config = checkpoint.get("run_config", {})
         for key in ("split_version", "split_schema_version", "split_manifest_sha256", "seed", "sampler"):
             if checkpoint_config.get(key) != run_metadata[key]:
@@ -243,9 +350,27 @@ def run_training(args: argparse.Namespace) -> Path:
                     f"checkpoint 的 {key} 与当前训练配置不一致: "
                     f"checkpoint={checkpoint_config.get(key)!r}, current={run_metadata[key]!r}"
                 )
+        checkpoint_ir_mode = str(checkpoint_config.get("ir_mode", "gray"))
+        if checkpoint_ir_mode != ir_mode:
+            raise DataContractError(
+                f"checkpoint 的 ir_mode 与当前模式不一致: "
+                f"checkpoint={checkpoint_ir_mode}, current={ir_mode}"
+            )
+        _validate_checkpoint_loss_weights(checkpoint_config, loss_weights)
+        # 延续最初 warm-start 的可审计来源；resume 本身不应抹掉初始化记录。
+        run_metadata["initialization"] = checkpoint_config.get("initialization")
+        run_metadata["resumed_from"] = {
+            "path": str(Path(resume).resolve()),
+            "sha256": sha256_file(resume),
+            "epoch": checkpoint.get("epoch"),
+        }
         model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scaler.load_state_dict(checkpoint.get("scaler", {}))
+        if not getattr(args, "reset_optimizer", False):
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scaler.load_state_dict(checkpoint.get("scaler", {}))
+        if args.learning_rate is not None:
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = learning_rate
         start_epoch = int(checkpoint["epoch"]) + 1
         best_val = float(checkpoint.get("best_val", best_val))
 
@@ -253,35 +378,80 @@ def run_training(args: argparse.Namespace) -> Path:
     (run_dir / "run_config.json").write_text(
         json.dumps(run_metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    if resume and not args.smoke_only:
+        previous_metrics = Path(resume).resolve().parent / "metrics.csv"
+        if previous_metrics.is_file():
+            shutil.copy2(previous_metrics, run_dir / "metrics.csv")
+    if resume and not args.smoke_only:
+        if getattr(args, "best_checkpoint", None):
+            best_payload = torch.load(
+                args.best_checkpoint, map_location="cpu", weights_only=False
+            )
+            if float(best_payload.get("best_val", float("inf"))) != best_val:
+                raise DataContractError(
+                    "--best-checkpoint 的 best_val 与恢复 checkpoint 不一致"
+                )
+            shutil.copy2(args.best_checkpoint, run_dir / "best.pt")
+        else:
+            baseline_checkpoint = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": start_epoch - 1,
+                "best_val": best_val,
+                "run_config": run_metadata,
+            }
+            torch.save(baseline_checkpoint, run_dir / "best.pt")
     global_steps = 0
+    training_started = time.perf_counter()
     for epoch in range(start_epoch, epochs):
         train_dataset.set_epoch(epoch)
         train_sampler.set_epoch(epoch)
         model.train()
-        epoch_total = 0.0
+        epoch_started = time.perf_counter()
+        epoch_totals = {
+            "loss": 0.0,
+            "intensity_loss": 0.0,
+            "gradient_loss": 0.0,
+            "ssim_loss": 0.0,
+            "edge_loss": 0.0,
+        }
         epoch_count = 0
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         for batch in train_loader:
             vis = batch["vis"].to(device, non_blocking=True)
             ir = batch["ir"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device.type, enabled=amp_enabled):
                 fused = model(vis, ir)
-                loss, _ = criterion(fused, ir, vis)
+            loss, components = criterion(fused.float(), ir.float(), vis.float())
             if not torch.isfinite(loss):
-                raise FloatingPointError(f"训练 loss 非有限值: {float(loss.detach())}")
+                raise FloatingPointError(
+                    "训练 loss 非有限值: "
+                    f"loss={float(loss.detach())}, samples={batch['sample_id']}, "
+                    f"fused_finite={bool(torch.isfinite(fused).all())}, "
+                    f"components={components}"
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            epoch_total += float(loss.detach()) * vis.shape[0]
-            epoch_count += vis.shape[0]
+            current_batch_size = vis.shape[0]
+            epoch_totals["loss"] += float(loss.detach()) * current_batch_size
+            for name in components:
+                epoch_totals[name] += float(components[name]) * current_batch_size
+            epoch_count += current_batch_size
             global_steps += 1
             if max_steps is not None and global_steps >= max_steps:
                 break
         if epoch_count == 0:
             raise DataContractError("training DataLoader 为空")
-        train_loss = epoch_total / epoch_count
+        train_metrics = {
+            name: value / epoch_count for name, value in epoch_totals.items()
+        }
+        train_loss = train_metrics["loss"]
         if args.smoke_only:
             result = {
                 **run_metadata,
@@ -295,8 +465,19 @@ def run_training(args: argparse.Namespace) -> Path:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return run_dir
 
-        val_loss = _validate_epoch(model, criterion, val_loader, device, amp_enabled)
-        log_row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
+        val_metrics = _validate_epoch(model, criterion, val_loader, device, amp_enabled)
+        val_loss = val_metrics["loss"]
+        log_row: dict[str, Any] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            **{f"train_{name}": train_metrics[name] for name in train_metrics if name != "loss"},
+            **{f"val_{name}": val_metrics[name] for name in val_metrics if name != "loss"},
+            "epoch_seconds": time.perf_counter() - epoch_started,
+            "elapsed_seconds": time.perf_counter() - training_started,
+        }
+        if device.type == "cuda":
+            log_row["peak_gpu_memory_bytes"] = int(torch.cuda.max_memory_allocated(device))
         _append_log(run_dir / "metrics.csv", log_row)
         checkpoint = {
             "model": model.state_dict(),
@@ -326,10 +507,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--lambda-intensity", type=float)
+    parser.add_argument("--lambda-gradient", type=float)
+    parser.add_argument("--lambda-ssim", type=float)
+    parser.add_argument("--lambda-edge", type=float)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help="只加载模型权重并从 epoch 0 重新训练，不恢复 optimizer/scaler",
+    )
+    parser.add_argument("--ir-mode", choices=IR_MODES, default="gray")
+    parser.add_argument(
+        "--best-checkpoint",
+        type=Path,
+        help="恢复 last.pt 时携带此前真实的 best.pt",
+    )
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="恢复模型/epoch，但重新初始化 optimizer 和 GradScaler",
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--max-steps", type=int)

@@ -21,16 +21,17 @@ from data_pipeline.schema import (
     read_csv_rows,
     resolve_data_path,
 )
-from inference_utils import (
+from .inference_utils import (
     infer_pair_tensor,
     load_inference_pair,
     load_model_checkpoint,
+    resolve_checkpoint_ir_mode,
     save_fused_png,
 )
 from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -250,14 +251,24 @@ def run_inference(args: argparse.Namespace) -> Path:
         raise DataContractError("正式 test split 禁止使用随机未训练权重")
     if args.split_version is not None and (args.ir is not None or args.ir_dir is not None):
         raise DataContractError("--split-version 不能与 --ir/--ir-dir 混用")
-    model = ResNetFusion(Residual, DecoderBlock, FusionBlock, CrossAttention)
     if args.checkpoint is not None:
+        ir_mode = resolve_checkpoint_ir_mode(
+            args.checkpoint, getattr(args, "ir_mode", "auto")
+        )
+        model = ResNetFusion(
+            Residual, DecoderBlock, FusionBlock, CrossAttention, ir_mode=ir_mode
+        )
         weight_source = {
             "status": "checkpoint_loaded",
             **load_model_checkpoint(model, args.checkpoint),
         }
         untrained_smoke = False
     elif args.allow_random_weights:
+        requested_ir_mode = getattr(args, "ir_mode", "auto")
+        ir_mode = "gray" if requested_ir_mode == "auto" else requested_ir_mode
+        model = ResNetFusion(
+            Residual, DecoderBlock, FusionBlock, CrossAttention, ir_mode=ir_mode
+        )
         weight_source = {
             "status": "random_untrained_smoke_only",
             "seed": int(args.seed),
@@ -333,6 +344,7 @@ def run_inference(args: argparse.Namespace) -> Path:
         "config_path": str(config_path),
         "input_source": input_source,
         "weights": weight_source,
+        "ir_mode": ir_mode,
         "device": str(device),
         "amp": amp_enabled,
         "requested_mode": args.mode,
@@ -368,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "runs")
     parser.add_argument("--mode", choices=("auto", "full", "sliding"), default="auto")
+    parser.add_argument("--ir-mode", choices=("auto", "gray", "learned_gray"), default="auto")
     parser.add_argument("--tile-size", type=int)
     parser.add_argument("--overlap", type=int)
     parser.add_argument("--max-full-tokens", type=int)

@@ -2,6 +2,53 @@ import torch
 from torch import nn
 
 
+IR_MODES = ("gray", "learned_gray")
+
+
+class GrayEnhancer(nn.Module):
+    """对单通道灰度 IR 做有界、恒等初始化的可学习增强。"""
+
+    def __init__(self, branch_channels=8):
+        super(GrayEnhancer, self).__init__()
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels=1,
+                        out_channels=branch_channels,
+                        kernel_size=kernel_size,
+                        stride=1,
+                        padding=kernel_size // 2,
+                        bias=False,
+                    ),
+                    nn.GroupNorm(4, branch_channels),
+                    nn.SiLU(),
+                )
+                for kernel_size in (3, 5, 7)
+            ]
+        )
+        feature_channels = branch_channels * len(self.branches)
+        self.residual_head = nn.Conv2d(feature_channels, 1, kernel_size=1)
+        self.gate_head = nn.Conv2d(feature_channels, 1, kernel_size=1)
+
+        # residual=0 使增强器初始时严格退化为恒等映射；gate=0.5 保持中性。
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.zeros_(self.gate_head.bias)
+
+    def forward(self, gray):
+        if gray.ndim != 4 or gray.shape[1] != 1:
+            raise ValueError(
+                f"GrayEnhancer 输入必须是 [B,1,H,W]，实际为 {tuple(gray.shape)}"
+            )
+        features = torch.cat([branch(gray) for branch in self.branches], dim=1)
+        residual = torch.tanh(self.residual_head(features))
+        gate = torch.sigmoid(self.gate_head(features))
+        # 对 gray∈[0,1]，gray + r*gray*(1-gray) 在 r∈[-1,1] 时仍位于 [0,1]。
+        return gray + gate * residual * gray * (1.0 - gray)
+
+
 class Residual(nn.Module):
     def __init__(self, input_channel,num_channel,use_1conv=False,strides=1):
         super(Residual,self).__init__()
@@ -66,8 +113,12 @@ class VIS_Encoder(nn.Module):
         return features
 
 class IR_Encoder(nn.Module):
-    def __init__(self,Residual):
+    def __init__(self,Residual,ir_mode="gray"):
         super(IR_Encoder,self).__init__()
+        if ir_mode not in IR_MODES:
+            raise ValueError(f"不支持的 IR 模式: {ir_mode!r}，可选值为 {IR_MODES}")
+        self.ir_mode = ir_mode
+        self.enhancer = GrayEnhancer() if ir_mode == "learned_gray" else nn.Identity()
         self.b1 = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=64, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm2d(64),
@@ -93,6 +144,7 @@ class IR_Encoder(nn.Module):
     def forward(self, x):
         features = []
 
+        x = self.enhancer(x)
         x = self.b1(x)
         features.append(x)
         x = self.b2(x)

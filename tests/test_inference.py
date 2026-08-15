@@ -18,14 +18,16 @@ from data_pipeline.schema import (
     canonical_rows_hash,
     load_dataset_config,
 )
-from inference import build_parser, collect_split_input_pairs, run_inference
-from inference_utils import (
+from main.inference import build_parser, collect_split_input_pairs, run_inference
+from main.inference_utils import (
     infer_pair_tensor,
     load_inference_pair,
     load_model_checkpoint,
+    resolve_checkpoint_ir_mode,
     sliding_window_inference,
     window_positions,
 )
+from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +120,49 @@ def _make_formal_split_fixture(root: Path) -> tuple[Path, dict, dict[str, str]]:
 
 
 class InferenceTests(unittest.TestCase):
+    def test_learned_gray_actual_model_full_and_sliding_shapes(self) -> None:
+        model = ResNetFusion(
+            Residual,
+            DecoderBlock,
+            FusionBlock,
+            CrossAttention,
+            ir_mode="learned_gray",
+        ).eval()
+        generator = torch.Generator().manual_seed(23)
+        vis = torch.rand(1, 3, 64, 64, generator=generator)
+        ir = torch.rand(1, 1, 64, 64, generator=generator)
+        for mode in ("full", "sliding"):
+            with self.subTest(mode=mode):
+                fused, details = infer_pair_tensor(
+                    model,
+                    vis,
+                    ir,
+                    device=torch.device("cpu"),
+                    requested_mode=mode,
+                    tile_size=32,
+                    overlap=8,
+                    factor=32,
+                )
+                self.assertEqual(tuple(fused.shape), (1, 3, 64, 64))
+                self.assertEqual(details["actual_mode"], mode)
+                self.assertTrue(torch.isfinite(fused).all())
+
+    def test_checkpoint_ir_mode_auto_and_explicit_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "candidate.pt"
+            torch.save(
+                {
+                    "model": torch.nn.Linear(2, 1).state_dict(),
+                    "run_config": {"ir_mode": "learned_gray"},
+                },
+                checkpoint,
+            )
+            self.assertEqual(
+                resolve_checkpoint_ir_mode(checkpoint), "learned_gray"
+            )
+            with self.assertRaisesRegex(DataContractError, "不一致"):
+                resolve_checkpoint_ir_mode(checkpoint, "gray")
+
     def test_formal_test_split_collection_and_output_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -151,7 +196,7 @@ class InferenceTests(unittest.TestCase):
                     str(root / "runs"),
                 ]
             )
-            with patch("inference.ResNetFusion", return_value=IdentityFusion()):
+            with patch("main.inference.ResNetFusion", return_value=IdentityFusion()):
                 run_dir = run_inference(args)
             metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(metadata["result_status"], "heldout_split_inference")

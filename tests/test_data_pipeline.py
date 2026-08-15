@@ -31,10 +31,16 @@ from data_pipeline.schema import (
 )
 from data_pipeline.splitting import create_split_version, generate_nested_group_assignments
 from data_pipeline.transforms import PairedGeometryTransform
-from dataset import PairedFusionDataset
-from loss import FusionLoss
-from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
-from train import run_training
+from main.dataset import PairedFusionDataset
+from main.inference_utils import load_initial_model_checkpoint
+from main.loss import FusionLoss
+from model import GrayEnhancer, CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFusion
+from main.train import (
+    DEFAULT_LOSS_WEIGHTS,
+    _loss_weights_from_args,
+    _validate_checkpoint_loss_weights,
+    run_training,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -421,6 +427,8 @@ class DataPipelineTests(unittest.TestCase):
         output = run_training(args)
         self.assertTrue((output / "smoke_result.json").is_file())
         self.assertFalse((output / "best.pt").exists())
+        smoke = json.loads((output / "smoke_result.json").read_text(encoding="utf-8"))
+        self.assertEqual(smoke["loss_weights"], DEFAULT_LOSS_WEIGHTS)
 
     def test_audit_detects_cross_split_exact_duplicate_and_source_fingerprint(self) -> None:
         modified_samples = [dict(row) for row in self.samples]
@@ -448,6 +456,97 @@ class DataPipelineTests(unittest.TestCase):
 
 
 class ModelSmokeTests(unittest.TestCase):
+    def test_loss_weight_validation_and_checkpoint_compatibility(self) -> None:
+        defaults = _loss_weights_from_args(argparse.Namespace())
+        self.assertEqual(defaults, DEFAULT_LOSS_WEIGHTS)
+        custom = _loss_weights_from_args(
+            argparse.Namespace(
+                lambda_intensity=2,
+                lambda_gradient=11,
+                lambda_ssim=4,
+                lambda_edge=1,
+            )
+        )
+        self.assertEqual(custom, {"intensity": 2.0, "gradient": 11.0, "ssim": 4.0, "edge": 1.0})
+        _validate_checkpoint_loss_weights({}, defaults)
+        with self.assertRaises(DataContractError):
+            _validate_checkpoint_loss_weights({}, custom)
+        for kwargs in (
+            {"lambda_intensity": -1, "lambda_gradient": 12, "lambda_ssim": 5, "lambda_edge": 2},
+            {"lambda_intensity": float("nan"), "lambda_gradient": 11, "lambda_ssim": 5, "lambda_edge": 2},
+            {"lambda_intensity": 0, "lambda_gradient": 0, "lambda_ssim": 0, "lambda_edge": 0},
+        ):
+            with self.assertRaises((DataContractError, ValueError)):
+                _loss_weights_from_args(argparse.Namespace(**kwargs))
+
+    def test_fusion_loss_default_custom_and_invalid_weights(self) -> None:
+        generator = torch.Generator().manual_seed(29)
+        fused = torch.rand(1, 3, 32, 32, generator=generator, requires_grad=True)
+        ir = torch.rand(1, 1, 32, 32, generator=generator)
+        vis = torch.rand(1, 3, 32, 32, generator=generator)
+        default_loss, components = FusionLoss()(fused, ir, vis)
+        expected = (
+            components["intensity_loss"]
+            + 10 * components["gradient_loss"]
+            + 5 * components["ssim_loss"]
+            + 2 * components["edge_loss"]
+        )
+        self.assertAlmostEqual(float(default_loss), expected, places=5)
+        custom_loss, _ = FusionLoss(2, 11, 4, 1)(fused, ir, vis)
+        custom_loss.backward()
+        self.assertTrue(torch.isfinite(custom_loss))
+        self.assertTrue(torch.isfinite(fused.grad).all())
+        for weights in ((-1, 12, 5, 2), (float("nan"), 11, 5, 2), (0, 0, 0, 0)):
+            with self.assertRaises(ValueError):
+                FusionLoss(*weights)
+
+    def test_gray_enhancer_is_identity_bounded_and_trainable(self) -> None:
+        enhancer = GrayEnhancer().train()
+        gray = torch.rand(2, 1, 32, 40)
+        initial = enhancer(gray)
+        self.assertTrue(torch.equal(initial, gray))
+        self.assertGreaterEqual(float(initial.min()), 0.0)
+        self.assertLessEqual(float(initial.max()), 1.0)
+
+        target = torch.zeros_like(initial)
+        torch.nn.functional.l1_loss(initial, target).backward()
+        gradient = enhancer.residual_head.weight.grad
+        self.assertIsNotNone(gradient)
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+    def test_learned_gray_warm_start_matches_gray_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "baseline.pt"
+            baseline = ResNetFusion(
+                Residual, DecoderBlock, FusionBlock, CrossAttention, ir_mode="gray"
+            ).eval()
+            torch.save({"model": baseline.state_dict(), "epoch": 9}, checkpoint)
+            candidate = ResNetFusion(
+                Residual,
+                DecoderBlock,
+                FusionBlock,
+                CrossAttention,
+                ir_mode="learned_gray",
+            ).eval()
+            metadata = load_initial_model_checkpoint(
+                candidate, checkpoint, ir_mode="learned_gray"
+            )
+            self.assertTrue(metadata["missing_keys"])
+            self.assertTrue(
+                all(
+                    key.startswith("ir_encoder.enhancer.")
+                    for key in metadata["missing_keys"]
+                )
+            )
+            generator = torch.Generator().manual_seed(17)
+            vis = torch.rand(1, 3, 64, 64, generator=generator)
+            ir = torch.rand(1, 1, 64, 64, generator=generator)
+            with torch.inference_mode():
+                baseline_output = baseline(vis, ir)
+                candidate_output = candidate(vis, ir)
+            self.assertTrue(torch.equal(baseline_output, candidate_output))
+
     def test_tiny_cpu_forward_and_loss_backward(self) -> None:
         model = ResNetFusion(Residual, DecoderBlock, FusionBlock, CrossAttention).train()
         criterion = FusionLoss()

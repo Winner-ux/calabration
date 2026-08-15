@@ -23,6 +23,8 @@
     "更显著"的响应，实现了信息互补保留。
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -165,6 +167,10 @@ class SSIMLoss(nn.Module):
         sigma1_sq = F.conv2d(img1 * img1, self.window, groups=3, padding=pad) - mu1_sq
         sigma2_sq = F.conv2d(img2 * img2, self.window, groups=3, padding=pad) - mu2_sq
         sigma12   = F.conv2d(img1 * img2, self.window, groups=3, padding=pad) - mu1_mu2
+        # E[x²] - E[x]² 在近似常量区域可能因舍入得到微小负数。
+        # 方差按定义非负，截断可避免 SSIM 分母接近/穿过零。
+        sigma1_sq = sigma1_sq.clamp_min(0.0)
+        sigma2_sq = sigma2_sq.clamp_min(0.0)
 
         # -------------------------------------------------
         # 第3步：SSIM 简化公式
@@ -181,8 +187,11 @@ class SSIMLoss(nn.Module):
         #   当局部区域亮度/对比度接近零时
         #   （如纯黑区域），防止分母为零导致数值爆炸
         # -------------------------------------------------
-        ssim_map = ((2 * mu1_mu2 + self.C1) * (2 * sigma12 + self.C2)) / \
-                   ((mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2))
+        numerator = (2 * mu1_mu2 + self.C1) * (2 * sigma12 + self.C2)
+        denominator = (mu1_sq + mu2_sq + self.C1) * (
+            sigma1_sq + sigma2_sq + self.C2
+        )
+        ssim_map = (numerator / denominator.clamp_min(1e-12)).clamp(-1.0, 1.0)
 
         # -------------------------------------------------
         # 第4步：全局平均
@@ -238,6 +247,18 @@ class FusionLoss(nn.Module):
         lambda_edge=2
     ):
         super(FusionLoss, self).__init__()
+
+        weights = {
+            "lambda_intensity": lambda_intensity,
+            "lambda_gradient": lambda_gradient,
+            "lambda_ssim": lambda_ssim,
+            "lambda_edge": lambda_edge,
+        }
+        for name, value in weights.items():
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} 必须是有限非负数，实际为 {value!r}")
+        if not any(float(value) > 0 for value in weights.values()):
+            raise ValueError("FusionLoss 权重不能全部为 0")
 
         # ==================================================
         # 损失权重注册

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import heapq
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -150,37 +151,77 @@ def _build_near_duplicate_rows(
     samples: list[dict[str, str]],
     split_lookup: Mapping[str, str],
     threshold: int,
+    *,
+    top_k_per_sample: int = 5,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, str]]:
+    """保留每个样本最接近的跨 split pHash 候选，避免审计 CSV 无界增长。"""
     usable = [row for row in samples if parse_bool(row.get("usable", "false"))]
-    result: list[dict[str, str]] = []
+    if top_k_per_sample <= 0:
+        raise DataContractError("near_duplicate_top_k_per_sample 必须为正")
+    heaps: dict[tuple[str, str], list[tuple[int, int, tuple[str, ...], dict[str, str]]]] = defaultdict(list)
+    comparisons = 0
+    threshold_matches = 0
+    sequence = 0
+
+    def retain(modality: str, sample_id: str, row: dict[str, str], distance: int) -> None:
+        nonlocal sequence
+        sequence += 1
+        row_key = (row["modality"], row["sample_id_a"], row["sample_id_b"])
+        entry = (-distance, -sequence, row_key, row)
+        heap = heaps[(modality, sample_id)]
+        if len(heap) < top_k_per_sample:
+            heapq.heappush(heap, entry)
+        elif entry[0] > heap[0][0]:
+            heapq.heapreplace(heap, entry)
+
     for modality in ("ir", "rgb"):
         field = f"{modality}_phash"
         for index, first in enumerate(usable):
             if not first.get(field):
                 continue
+            split_a = split_lookup.get(first["sample_id"], "")
+            if not split_a:
+                continue
             for second in usable[index + 1 :]:
                 if not second.get(field):
                     continue
+                split_b = split_lookup.get(second["sample_id"], "")
+                if not split_b or split_a == split_b:
+                    continue
+                comparisons += 1
                 distance = phash_distance(first[field], second[field])
                 if distance > threshold:
                     continue
-                split_a = split_lookup.get(first["sample_id"], "")
-                split_b = split_lookup.get(second["sample_id"], "")
-                cross_split = bool(split_a and split_b and split_a != split_b)
-                result.append(
-                    {
-                        "sample_id_a": first["sample_id"],
-                        "sample_id_b": second["sample_id"],
-                        "modality": modality,
-                        "phash_distance": str(distance),
-                        "group_id_a": first["leakage_group_id"],
-                        "group_id_b": second["leakage_group_id"],
-                        "split_a": split_a,
-                        "split_b": split_b,
-                        "cross_split": str(cross_split).lower(),
-                    }
-                )
+                threshold_matches += 1
+                row = {
+                    "sample_id_a": first["sample_id"],
+                    "sample_id_b": second["sample_id"],
+                    "modality": modality,
+                    "phash_distance": str(distance),
+                    "group_id_a": first["leakage_group_id"],
+                    "group_id_b": second["leakage_group_id"],
+                    "split_a": split_a,
+                    "split_b": split_b,
+                    "cross_split": "true",
+                }
+                retain(modality, first["sample_id"], row, distance)
+                retain(modality, second["sample_id"], row, distance)
+    selected: dict[tuple[str, ...], dict[str, str]] = {}
+    for heap in heaps.values():
+        for _, _, row_key, row in heap:
+            selected[row_key] = row
+    result = list(selected.values())
     result.sort(key=lambda row: (int(row["phash_distance"]), row["modality"], row["sample_id_a"], row["sample_id_b"]))
+    if stats is not None:
+        stats.update(
+            {
+                "cross_split_comparisons": comparisons,
+                "threshold_matches_before_limit": threshold_matches,
+                "retained_candidates": len(result),
+                "top_k_per_sample": top_k_per_sample,
+            }
+        )
     return result
 
 
@@ -435,7 +476,15 @@ def audit_dataset(
 
     registration_rows = _build_registration_rows(root, samples, config)
     threshold = int(config["audit"].get("near_duplicate_hamming_threshold", 5))
-    duplicate_rows = _build_near_duplicate_rows(samples, split_lookup, threshold)
+    duplicate_stats: dict[str, int] = {}
+    top_k = int(config["audit"].get("near_duplicate_top_k_per_sample", 5))
+    duplicate_rows = _build_near_duplicate_rows(
+        samples,
+        split_lookup,
+        threshold,
+        top_k_per_sample=top_k,
+        stats=duplicate_stats,
+    )
     split_category_counts: dict[str, dict[str, dict[str, int]]] = {}
     for split, ids in split_ids.items():
         pair_counts = Counter(id_to_row[sample_id]["category"] for sample_id in ids if sample_id in id_to_row)
@@ -481,6 +530,8 @@ def audit_dataset(
         "dataset_manifest_sha256": canonical_rows_hash(samples, SAMPLE_FIELDS),
         "evaluation_preprocessing_deterministic": deterministic,
         "near_duplicate_candidate_count": len(duplicate_rows),
+        "near_duplicate_scope": "cross_split_top_k_per_sample",
+        "near_duplicate_stats": duplicate_stats,
         "registration_manual_review_count": sum(
             row["review_status"] == "manual_review" for row in registration_rows
         ),

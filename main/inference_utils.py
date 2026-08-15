@@ -15,6 +15,7 @@ from PIL import Image
 
 from data_pipeline.schema import DataContractError
 from data_pipeline.transforms import bt601_to_gray
+from model import IR_MODES
 
 
 def _validate_pair_tensors(vis: torch.Tensor, ir: torch.Tensor) -> None:
@@ -342,30 +343,26 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def load_model_checkpoint(
-    model: torch.nn.Module,
-    checkpoint_path: str | Path,
-) -> dict[str, Any]:
-    """严格加载训练 checkpoint 或纯 state_dict，并返回可审计的来源信息。"""
-    path = Path(checkpoint_path).resolve()
+def _checkpoint_payload(path: Path) -> Mapping[str, Any]:
     if not path.is_file():
         raise DataContractError(f"checkpoint 不存在: {path}")
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise DataContractError(f"无法安全读取 checkpoint {path}: {exc}") from exc
-    checkpoint_metadata: Mapping[str, Any] = {}
-    if isinstance(payload, Mapping) and isinstance(payload.get("model"), Mapping):
+    if not isinstance(payload, Mapping):
+        raise DataContractError(f"checkpoint 根节点必须是映射: {path}")
+    return payload
+
+
+def _checkpoint_state(payload: Mapping[str, Any]) -> tuple[dict[str, torch.Tensor], str]:
+    if isinstance(payload.get("model"), Mapping):
         state_dict = payload["model"]
-        checkpoint_metadata = payload
         layout = "training_checkpoint"
-    elif isinstance(payload, Mapping) and isinstance(payload.get("state_dict"), Mapping):
+    elif isinstance(payload.get("state_dict"), Mapping):
         state_dict = payload["state_dict"]
-        checkpoint_metadata = payload
         layout = "state_dict_wrapper"
-    elif isinstance(payload, Mapping) and payload and all(
-        isinstance(value, torch.Tensor) for value in payload.values()
-    ):
+    elif payload and all(isinstance(value, torch.Tensor) for value in payload.values()):
         state_dict = payload
         layout = "raw_state_dict"
     else:
@@ -373,6 +370,79 @@ def load_model_checkpoint(
     state_dict = dict(state_dict)
     if state_dict and all(str(key).startswith("module.") for key in state_dict):
         state_dict = {str(key)[7:]: value for key, value in state_dict.items()}
+    return state_dict, layout
+
+
+def resolve_checkpoint_ir_mode(
+    checkpoint_path: str | Path,
+    requested_mode: str = "auto",
+) -> str:
+    """从 checkpoint 推断 IR 模式，并拒绝显式模式冲突。"""
+    if requested_mode not in ("auto", *IR_MODES):
+        raise DataContractError(f"非法 IR 模式: {requested_mode!r}")
+    path = Path(checkpoint_path).resolve()
+    payload = _checkpoint_payload(path)
+    run_config = payload.get("run_config")
+    stored_mode = "gray"
+    if isinstance(run_config, Mapping):
+        stored_mode = str(run_config.get("ir_mode", "gray"))
+    if stored_mode not in IR_MODES:
+        raise DataContractError(f"checkpoint 包含未知 ir_mode: {stored_mode!r}")
+    if requested_mode != "auto" and requested_mode != stored_mode:
+        raise DataContractError(
+            f"显式 ir_mode 与 checkpoint 不一致: requested={requested_mode}, "
+            f"checkpoint={stored_mode}"
+        )
+    return stored_mode
+
+
+def load_initial_model_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: str | Path,
+    *,
+    ir_mode: str,
+) -> dict[str, Any]:
+    """只加载模型权重；learned_gray 仅允许缺少新增增强器参数。"""
+    if ir_mode not in IR_MODES:
+        raise DataContractError(f"非法 IR 模式: {ir_mode!r}")
+    path = Path(checkpoint_path).resolve()
+    payload = _checkpoint_payload(path)
+    state_dict, layout = _checkpoint_state(payload)
+    try:
+        if ir_mode == "gray":
+            model.load_state_dict(state_dict, strict=True)
+            missing_keys: list[str] = []
+        else:
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            missing_keys = list(incompatible.missing_keys)
+            invalid_missing = [
+                key for key in missing_keys if not key.startswith("ir_encoder.enhancer.")
+            ]
+            if invalid_missing or incompatible.unexpected_keys:
+                raise DataContractError(
+                    "learned_gray 初始化仅允许缺少 ir_encoder.enhancer.*；"
+                    f"invalid_missing={invalid_missing}, "
+                    f"unexpected={list(incompatible.unexpected_keys)}"
+                )
+    except RuntimeError as exc:
+        raise DataContractError(f"初始化 checkpoint 与当前模型结构不兼容: {exc}") from exc
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "layout": layout,
+        "source_epoch": payload.get("epoch"),
+        "missing_keys": missing_keys,
+    }
+
+
+def load_model_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: str | Path,
+) -> dict[str, Any]:
+    """严格加载训练 checkpoint 或纯 state_dict，并返回可审计的来源信息。"""
+    path = Path(checkpoint_path).resolve()
+    payload = _checkpoint_payload(path)
+    state_dict, layout = _checkpoint_state(payload)
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:
@@ -381,6 +451,6 @@ def load_model_checkpoint(
         "path": str(path),
         "sha256": sha256_file(path),
         "layout": layout,
-        "epoch": checkpoint_metadata.get("epoch"),
-        "run_config": checkpoint_metadata.get("run_config"),
+        "epoch": payload.get("epoch"),
+        "run_config": payload.get("run_config"),
     }
