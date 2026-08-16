@@ -32,6 +32,7 @@ from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFus
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "calibrated_v1"
 
 
 @dataclass(frozen=True)
@@ -376,7 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="仅用于代码路径 smoke；输出会显式标记为未训练",
     )
-    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data")
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "runs")
     parser.add_argument("--mode", choices=("auto", "full", "sliding"), default="auto")

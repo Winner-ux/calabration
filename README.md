@@ -21,9 +21,9 @@ D:\anaconda\envs\pytorch\python.exe
 
 ## 数据工作流
 
-完整契约见 [`data/README.md`](data/README.md) 和
-[`data/dataset.yaml`](data/dataset.yaml)。正式图片只允许存在于 `data/paired/`，
-split CSV 只保存 `sample_id`。
+正式数据集位于 [`datasets/calibrated_v1/`](datasets/calibrated_v1/)，数据契约见
+[`datasets/calibrated_v1/dataset.yaml`](datasets/calibrated_v1/dataset.yaml)。正式图片只允许
+存在于 `datasets/calibrated_v1/paired/`，split CSV 只保存 `sample_id`。
 
 外部参考数据 dry-run（不会复制）：
 
@@ -38,15 +38,15 @@ python scripts/import_paired_data.py `
 导入后必须人工填写：
 
 ```text
-data/manifests/group_assignments.csv
+datasets/calibrated_v1/manifests/group_assignments.csv
 ```
 
 然后依次执行：
 
 ```powershell
 python scripts/build_manifest.py
-python scripts/make_split.py --version v1 --seed 42
-python scripts/audit_dataset.py --split-version v1 --overwrite
+python scripts/make_split.py --version calibrated_v1 --seed 42
+python scripts/audit_dataset.py --split-version calibrated_v1 --overwrite
 ```
 
 每个实验必须包含 `health`、`health_sick`、`sick` 三类且每类恰好一个 clip；
@@ -61,12 +61,12 @@ assignment。数据增加后使用 `v2`、`v3` 等新版本，不能覆盖旧版
 ## Dataset
 
 ```python
-from dataset import PairedFusionDataset
+from main.dataset import PairedFusionDataset
 
 dataset = PairedFusionDataset(
-    data_root="data",
-    samples_manifest="data/manifests/samples.csv",
-    split_manifest="data/splits/v1/train.csv",
+    data_root="datasets/calibrated_v1",
+    samples_manifest="datasets/calibrated_v1/manifests/samples.csv",
+    split_manifest="datasets/calibrated_v1/splits/calibrated_v1/train.csv",
     paired_transform=paired_transform,
     rgb_transform=rgb_transform,
     ir_conversion="bt601",
@@ -80,7 +80,7 @@ dataset = PairedFusionDataset(
 只有 full audit 通过的 formal split 能启动正式训练：
 
 ```powershell
-python train.py --split-version v1
+python -m main.train --split-version calibrated_v1
 ```
 
 split 在训练前固定，`train.py` 不会动态重划验证集。训练集使用确定性的
@@ -90,7 +90,7 @@ split 在训练前固定，`train.py` 不会动态重划验证集。训练集使
 单步集成检查：
 
 ```powershell
-python train.py --split-version v1 --smoke-only --max-steps 1
+python -m main.train --split-version calibrated_v1 --smoke-only --max-steps 1
 ```
 
 `--smoke-only` 不保存 `best.pt` 或 `last.pt`，不能作为正式训练结果。
@@ -100,7 +100,7 @@ python train.py --split-version v1 --smoke-only --max-steps 1
 单对同名 PNG 使用训练 checkpoint 推理：
 
 ```powershell
-python inference.py `
+python -m main.inference `
   --vis "path\to\rgb\000001.png" `
   --ir "path\to\ir\000001.png" `
   --checkpoint "runs\train-...\best.pt"
@@ -109,7 +109,7 @@ python inference.py `
 严格按相对路径批量配对目录：
 
 ```powershell
-python inference.py `
+python -m main.inference `
   --vis-dir "path\to\rgb" `
   --ir-dir "path\to\ir" `
   --checkpoint "runs\train-...\best.pt"
@@ -118,9 +118,8 @@ python inference.py `
 正式训练完成后，严格按已完整审计的 `test.csv` 导出持出集融合图像：
 
 ```powershell
-python inference.py `
-  --data-root data `
-  --split-version v1 `
+python -m main.inference `
+  --split-version calibrated_v1 `
   --split test `
   --checkpoint "runs\train-...\best.pt"
 ```
@@ -137,7 +136,7 @@ python inference.py `
 当前项目尚无正式训练 checkpoint。若只检查代码路径，可显式使用：
 
 ```powershell
-python inference.py `
+python -m main.inference `
   --vis "path\to\rgb\000001.png" `
   --ir "path\to\ir\000001.png" `
   --allow-random-weights `

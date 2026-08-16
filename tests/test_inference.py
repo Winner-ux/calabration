@@ -31,6 +31,7 @@ from model import CrossAttention, DecoderBlock, FusionBlock, Residual, ResNetFus
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "calibrated_v1"
 
 
 class IdentityFusion(torch.nn.Module):
@@ -43,7 +44,7 @@ def _make_formal_split_fixture(root: Path) -> tuple[Path, dict, dict[str, str]]:
     data_root = root / "data"
     data_root.mkdir()
     (data_root / "dataset.yaml").write_text(
-        (PROJECT_ROOT / "data" / "dataset.yaml").read_text(encoding="utf-8"),
+        (DEFAULT_DATA_ROOT / "dataset.yaml").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     config = load_dataset_config(data_root / "dataset.yaml")
@@ -323,7 +324,7 @@ class InferenceTests(unittest.TestCase):
             ir_array[..., 1] = 255
             Image.fromarray(vis_array, mode="RGB").save(vis_path)
             Image.fromarray(ir_array, mode="RGB").save(ir_path)
-            config = load_dataset_config(PROJECT_ROOT / "data" / "dataset.yaml")
+            config = load_dataset_config(DEFAULT_DATA_ROOT / "dataset.yaml")
             vis, ir = load_inference_pair(vis_path, ir_path, config)
             self.assertEqual(tuple(vis.shape), (1, 3, 17, 19))
             self.assertEqual(tuple(ir.shape), (1, 1, 17, 19))

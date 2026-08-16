@@ -18,6 +18,7 @@ from typing import Any
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "calibrated_v1"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -324,8 +325,8 @@ def main() -> int:
         type=Path,
         help="可选的 frames.csv/summary.json/sync_preview.png 根目录",
     )
-    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data")
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "data" / "dataset.yaml")
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--config", type=Path, default=DEFAULT_DATA_ROOT / "dataset.yaml")
     parser.add_argument(
         "--execute-copy",
         action="store_true",

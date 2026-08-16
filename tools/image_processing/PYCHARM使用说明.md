@@ -2,9 +2,9 @@
 
 ## 一、首次打开
 
-1. 在 PyCharm 中打开整个 `dataset` 文件夹，不要只打开 `image_processing`。
+1. 在 PyCharm 中打开 `Fusion_resnet/tools/image_processing` 文件夹。
 2. 在 **Settings → Project → Python Interpreter** 中选择当前 Anaconda Python。
-3. 如果 PyCharm 提示安装 `image_processing/requirements.txt`，在界面中点击安装即可；不需要打开终端。
+3. 如果 PyCharm 提示安装 `requirements.txt`，在界面中点击安装即可；不需要打开终端。
 4. 右上角运行列表中应显示 **标定处理** 和 **实验处理**。
 
 如果运行列表没有自动出现，也可以在项目树中右键 `calibration_app.py` 或

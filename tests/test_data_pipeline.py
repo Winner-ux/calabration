@@ -44,6 +44,7 @@ from main.train import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "calibrated_v1"
 CATEGORIES = ("health", "health_sick", "sick")
 
 
@@ -63,7 +64,7 @@ def _write_rgb(path: Path, category_index: int, experiment_index: int) -> None:
 def _make_synthetic_data(root: Path) -> tuple[dict, list[dict[str, str]], list[dict[str, str]]]:
     data_root = root / "data"
     data_root.mkdir(parents=True)
-    config = yaml.safe_load((PROJECT_ROOT / "data" / "dataset.yaml").read_text(encoding="utf-8"))
+    config = yaml.safe_load((DEFAULT_DATA_ROOT / "dataset.yaml").read_text(encoding="utf-8"))
     config["preprocessing"]["crop_size"] = 64
     config["training"]["epochs"] = 1
     config["training"]["batch_size"] = 2

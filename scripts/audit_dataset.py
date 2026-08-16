@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "calibrated_v1"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -23,8 +24,8 @@ from data_pipeline.schema import (  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data")
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "data" / "dataset.yaml")
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--config", type=Path, default=DEFAULT_DATA_ROOT / "dataset.yaml")
     parser.add_argument("--split-version")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -59,4 +60,3 @@ if __name__ == "__main__":
     except (DataContractError, FileExistsError, OSError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(2)
-

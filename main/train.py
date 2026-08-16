@@ -36,6 +36,7 @@ from model import IR_MODES, CrossAttention, DecoderBlock, FusionBlock, Residual,
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "datasets" / "calibrated_v1"
 DEFAULT_LOSS_WEIGHTS = {
     "intensity": 1.0,
     "gradient": 10.0,
@@ -500,8 +501,8 @@ def run_training(args: argparse.Namespace) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data")
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "data" / "dataset.yaml")
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--config", type=Path, default=DEFAULT_DATA_ROOT / "dataset.yaml")
     parser.add_argument("--split-version", required=True)
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "runs")
     parser.add_argument("--epochs", type=int)
