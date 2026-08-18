@@ -199,6 +199,7 @@ def process_all_pairs(
     ir_dir=APPLY_IR_PATH,
     output_dir=APPLY_OUTPUT_PATH,
     selected_keys=None,
+    model_path=CALIBRATION_MODEL_PATH,
 ):
     """处理所有同名 RGB/IR 图像对，并返回可序列化的运行报告。"""
     rgb_output = (
@@ -225,10 +226,10 @@ def process_all_pairs(
     for folder in (rgb_output, ir_output, preview_output, diagnostic_output):
         os.makedirs(folder, exist_ok=True)
 
-    H, calibration_data = load_calibration()
+    H, calibration_data = load_calibration(model_path)
     if calibration_data.get("source") == "identity_fallback":
         raise FileNotFoundError(
-            f"未找到标定模型：{CALIBRATION_MODEL_PATH}\n"
+            f"未找到标定模型：{model_path}\n"
             "请先运行 python calibrate.py 生成模型。"
         )
     _validate_homography(H)
@@ -253,7 +254,19 @@ def process_all_pairs(
 
     report = {
         "date": datetime.now().isoformat(),
-        "model_path": os.path.abspath(CALIBRATION_MODEL_PATH),
+        "model_path": os.path.abspath(model_path),
+        "model_quality_status": calibration_data.get("calibration", {}).get(
+            "quality_status"
+        ),
+        "model_geometry_passed": calibration_data.get("calibration", {}).get(
+            "geometry_passed"
+        ),
+        "model_sample_count_passed": calibration_data.get("calibration", {}).get(
+            "sample_count_passed"
+        ),
+        "model_diversity_warning": calibration_data.get("calibration", {}).get(
+            "diversity_warning"
+        ),
         "transform_direction": "IR_to_RGB",
         "Homography_calibration_IR_to_RGB": H.tolist(),
         "calibration_reference_sizes": {

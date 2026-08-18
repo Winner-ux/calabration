@@ -9,6 +9,17 @@ import os
 
 import cv2
 
+
+PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
+
+
+def _configured_path(env_name, *default_parts):
+    """Return an absolute path from the environment or a project-relative default."""
+    configured = os.getenv(env_name)
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    return os.path.join(PROJECT_PATH, *default_parts)
+
 # ----------------------------------------------------------
 # 棋盘格参数
 # ----------------------------------------------------------
@@ -21,32 +32,31 @@ SQUARE_SIZE = 25                 # 每格实际尺寸 (mm)
 # ----------------------------------------------------------
 # 标定图像路径
 # ----------------------------------------------------------
-RGB_PATH = r"C:\Users\qwhzn\Desktop\RGB_IR_Calibration\calibration\rgb"
-# 使用原始 IR；calibrate.py 只在内存中顺时针旋转，不再放大图像。
-IR_PATH = r"C:\Users\qwhzn\Desktop\RGB_IR_Calibration\calibration\ir_original_1920x1080"
+RGB_PATH = _configured_path("RGB_IR_CALIBRATION_RGB_PATH", "calibration", "rgb")
+IR_PATH = _configured_path("RGB_IR_CALIBRATION_IR_PATH", "calibration", "ir")
 
 # 尺寸均按 (width, height) 记录。IR 原图 1920x1080 顺时针旋转后为 1080x1920。
-CALIBRATION_RGB_REFERENCE_SIZE = (720, 1280)
-CALIBRATION_IR_REFERENCE_SIZE = (1080, 1920)
-CALIBRATION_IR_ROTATION = "clockwise_90"
+# 当前 processing_workspace 已把两路图像规范化到相同的横向分辨率。
+CALIBRATION_RGB_REFERENCE_SIZE = (1920, 1080)
+CALIBRATION_IR_REFERENCE_SIZE = (1920, 1080)
+CALIBRATION_IR_ROTATION = "none"
 
 # 运行图与标定参考图的宽高比相对差异不得超过 0.5%。超过该值通常意味着
 # 裁剪或 FOV 已改变，不能再把差异当成单纯分辨率缩放。
 ASPECT_RATIO_TOLERANCE = 0.005
 
 # 测试图像路径
-RGB_TEST = r"C:\Users\qwhzn\Desktop\RGB_IR_Calibration\test\rgb_test\001.png"
-IR_TEST  = r"C:\Users\qwhzn\Desktop\RGB_IR_Calibration\test\ir_test\001.png"
+RGB_TEST = _configured_path("RGB_IR_TEST_RGB_PATH", "test", "rgb_test", "001.png")
+IR_TEST = _configured_path("RGB_IR_TEST_IR_PATH", "test", "ir_test", "001.png")
 
 # 最终输出目录（按当前项目要求保存到项目内部）
-SAVE_PATH = r"C:\Users\qwhzn\Desktop\RGB_IR_Calibration\output"
+SAVE_PATH = _configured_path("RGB_IR_OUTPUT_PATH", "output")
 
 # ----------------------------------------------------------
 # 已有模型的实际应用路径
 # ----------------------------------------------------------
 # 将待处理图像分别放入 input/rgb 和 input/ir；同名文件视为一对，
 # 文件扩展名可以不同，例如 rgb/001.jpg 与 ir/001.png。
-PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
 APPLY_INPUT_PATH = os.path.join(PROJECT_PATH, "input")
 APPLY_RGB_PATH = os.path.join(APPLY_INPUT_PATH, "rgb")
 APPLY_IR_PATH = os.path.join(APPLY_INPUT_PATH, "ir")
@@ -100,15 +110,21 @@ RANSAC_MAX_ITERS = 2000          # 最大迭代次数
 RANSAC_CONFIDENCE = 0.995        # 置信度
 
 # 单对角点质量门槛；任何角点异常都会拒绝整对，不删除单个角点。
-PAIR_MAX_RMSE_PX = 0.6
-PAIR_MAX_P95_PX = 1.0
-PAIR_MAX_ERROR_PX = 1.5
+# 旧门槛以 RGB 短边 720 px 为基准；当前短边为 1080 px。像素误差
+# 随线性分辨率等效缩放，保持相同的物理/归一化精度要求。
+CALIBRATION_THRESHOLD_BASE_SHORT_EDGE = 720
+CALIBRATION_THRESHOLD_SCALE = (
+    min(CALIBRATION_RGB_REFERENCE_SIZE) / CALIBRATION_THRESHOLD_BASE_SHORT_EDGE
+)
+PAIR_MAX_RMSE_PX = 0.6 * CALIBRATION_THRESHOLD_SCALE
+PAIR_MAX_P95_PX = 1.0 * CALIBRATION_THRESHOLD_SCALE
+PAIR_MAX_ERROR_PX = 1.5 * CALIBRATION_THRESHOLD_SCALE
 
 # 全局模型与留一组交叉验证验收门槛（单位为标定 RGB 像素）。
-GLOBAL_MAX_RMSE_PX = 0.5
-GLOBAL_MAX_P95_PX = 0.8
-GLOBAL_MAX_ERROR_PX = 1.5
-LOOCV_MAX_RMSE_PX = 0.8
+GLOBAL_MAX_RMSE_PX = 0.5 * CALIBRATION_THRESHOLD_SCALE
+GLOBAL_MAX_P95_PX = 0.8 * CALIBRATION_THRESHOLD_SCALE
+GLOBAL_MAX_ERROR_PX = 1.5 * CALIBRATION_THRESHOLD_SCALE
+LOOCV_MAX_RMSE_PX = 0.8 * CALIBRATION_THRESHOLD_SCALE
 
 # ----------------------------------------------------------
 # 测试图像精配准参数
@@ -136,6 +152,11 @@ REFINE_MAX_MEDIAN_ERROR = 2.0
 # 质量控制
 # ----------------------------------------------------------
 MIN_VALID_PAIRS = 18             # 高精度全局模型的最少合格标定对数
+MIN_PROVISIONAL_VALID_PAIRS = 4  # 当前 12 对试运行允许应用模型的最低有效对数
+
+# 棋盘姿态多样性只作为警告，不阻止模型应用。
+CALIBRATION_DIVERSITY_MIN_CENTER_SPAN_RATIO = 0.05
+CALIBRATION_DIVERSITY_MIN_AREA_RATIO = 1.05
 
 # 配准有效性：warp 后有效像素比例低于此值 → 警告
 MIN_VALID_WARP_RATIO = 0.95
@@ -165,7 +186,7 @@ VIDEO_EXPORT_PREVIEW_COUNT = 12
 # ----------------------------------------------------------
 # 用户把新视频投递到 processing_workspace/input；程序只读这些输入，
 # 所有规范化视频、抽帧图片、报告和状态都写入独立目录。
-DATASET_ROOT = r"C:\Users\qwhzn\Desktop\dataset"
+DATASET_ROOT = _configured_path("RGB_IR_DATASET_ROOT", "dataset")
 PROCESSING_WORKSPACE_PATH = os.path.join(DATASET_ROOT, "processing_workspace")
 PROCESSING_INPUT_PATH = os.path.join(PROCESSING_WORKSPACE_PATH, "input")
 PROCESSING_OUTPUT_PATH = os.path.join(PROCESSING_WORKSPACE_PATH, "output")
@@ -184,3 +205,17 @@ PROCESSING_PREVIEW_COUNT = VIDEO_EXPORT_PREVIEW_COUNT
 PROCESSING_H264_CRF = 18
 PROCESSING_H264_PRESET = "medium"
 PROCESSING_SCHEMA_VERSION = 1
+
+# ----------------------------------------------------------
+# 当前分组数据集的标定/配准输出
+# ----------------------------------------------------------
+DATASET_CALIBRATION_INPUT_PATH = os.path.join(PROCESSING_OUTPUT_PATH, "calibration")
+DATASET_EXPERIMENT_INPUT_PATH = os.path.join(PROCESSING_OUTPUT_PATH, "experiment")
+DATASET_CALIBRATED_OUTPUT_PATH = os.path.join(DATASET_ROOT, "calibrated_output")
+DATASET_MODEL_OUTPUT_PATH = os.path.join(DATASET_CALIBRATED_OUTPUT_PATH, "_models")
+DATASET_REGISTERED_OUTPUT_PATH = os.path.join(
+    DATASET_CALIBRATED_OUTPUT_PATH, "experiment"
+)
+DATASET_BATCH_REPORT_PATH = os.path.join(
+    DATASET_CALIBRATED_OUTPUT_PATH, "batch_report.yaml"
+)

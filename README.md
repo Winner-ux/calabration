@@ -8,6 +8,13 @@
 - 输入值域：`[0,1]`
 - 训练裁剪默认：448×448
 
+## RGB/IR 相机标定
+
+棋盘格标定、IR → RGB 配准、批量模型应用和几何质量检查已整理到
+[`calibration_tools/`](calibration_tools/README.md)。该模块原目录名
+`calabration/` 存在拼写错误，本次统一采用 `calibration_tools`；原始图像和生成结果
+均由 `.gitignore` 排除，不进入公开仓库。
+
 ## 已验证环境
 
 本次实际验证使用：Python 3.12.0、PyTorch 2.5.1、CUDA 12.1、RTX 4060

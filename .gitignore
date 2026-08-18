@@ -38,6 +38,18 @@ data/splits/
 dataset/
 datasets/
 
+# Local RGB/IR calibration inputs and outputs
+/calibration/
+/test/
+/input/rgb/
+/input/ir/
+/output/
+calibration_tools/calibration/
+calibration_tools/test/
+calibration_tools/input/rgb/
+calibration_tools/input/ir/
+calibration_tools/output/
+
 # Model weights and exports
 weights/
 checkpoints/

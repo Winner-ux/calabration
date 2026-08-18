@@ -79,8 +79,8 @@ def _find_images(folder):
     return sorted(set(files))
 
 
-def load_image_pairs():
-    rgb_files, ir_files = _find_images(RGB_PATH), _find_images(IR_PATH)
+def load_image_pairs(rgb_dir=RGB_PATH, ir_dir=IR_PATH):
+    rgb_files, ir_files = _find_images(rgb_dir), _find_images(ir_dir)
     rgb_by_name = {os.path.splitext(os.path.basename(p))[0]: p for p in rgb_files}
     ir_by_name = {os.path.splitext(os.path.basename(p))[0]: p for p in ir_files}
     common = sorted(set(rgb_by_name) & set(ir_by_name))
@@ -89,8 +89,8 @@ def load_image_pairs():
     return list(zip(rgb_files, ir_files))
 
 
-def rotate_calibration_ir(image):
-    rotation = str(CALIBRATION_IR_ROTATION).strip().lower()
+def rotate_calibration_ir(image, rotation=CALIBRATION_IR_ROTATION):
+    rotation = str(rotation).strip().lower()
     operations = {
         "none": None,
         "clockwise_90": cv2.ROTATE_90_CLOCKWISE,
@@ -98,7 +98,7 @@ def rotate_calibration_ir(image):
         "rotate_180": cv2.ROTATE_180,
     }
     if rotation not in operations:
-        raise ValueError(f"不支持 CALIBRATION_IR_ROTATION={CALIBRATION_IR_ROTATION!r}")
+        raise ValueError(f"不支持 CALIBRATION_IR_ROTATION={rotation!r}")
     operation = operations[rotation]
     return image.copy() if operation is None else cv2.rotate(image, operation)
 
@@ -349,19 +349,59 @@ def _validate_reference_size(actual, expected, label):
         )
 
 
-def main():
-    pattern = CHECKERBOARD
+def _diversity_metrics(accepted, reference_size):
+    width, height = reference_size
+    centers = np.asarray([item["rgb"].mean(axis=0) for item in accepted])
+    areas = [
+        cv2.contourArea(cv2.convexHull(item["rgb"].astype(np.float32)))
+        / float(width * height)
+        for item in accepted
+    ]
+    center_span = centers.max(axis=0) - centers.min(axis=0)
+    center_span_ratio = [
+        float(center_span[0] / width), float(center_span[1] / height)
+    ]
+    area_ratio = float(max(areas) / min(areas)) if min(areas) > 0 else float("inf")
+    warning = bool(
+        max(center_span_ratio) < CALIBRATION_DIVERSITY_MIN_CENTER_SPAN_RATIO
+        and area_ratio < CALIBRATION_DIVERSITY_MIN_AREA_RATIO
+    )
+    return {
+        "warning": warning,
+        "center_span_px": [float(center_span[0]), float(center_span[1])],
+        "center_span_ratio": center_span_ratio,
+        "checkerboard_area_ratio": area_ratio,
+        "minimum_center_span_ratio": CALIBRATION_DIVERSITY_MIN_CENTER_SPAN_RATIO,
+        "minimum_area_ratio": CALIBRATION_DIVERSITY_MIN_AREA_RATIO,
+        "enforcement": "warning_only",
+    }
+
+
+def calibrate_group(rgb_dir, ir_dir, model_output_dir, settings=None):
+    settings = dict(settings or {})
+    pattern = tuple(settings.get("checkerboard", CHECKERBOARD))
+    rgb_reference_size = tuple(settings.get(
+        "rgb_reference_size", CALIBRATION_RGB_REFERENCE_SIZE
+    ))
+    ir_reference_size = tuple(settings.get(
+        "ir_reference_size", CALIBRATION_IR_REFERENCE_SIZE
+    ))
+    ir_rotation = settings.get("ir_rotation", CALIBRATION_IR_ROTATION)
+    formal_minimum = int(settings.get("minimum_valid_pairs", MIN_VALID_PAIRS))
+    provisional_minimum = int(settings.get(
+        "minimum_provisional_valid_pairs", MIN_PROVISIONAL_VALID_PAIRS
+    ))
     if pattern is None:
         raise ValueError("高精度模式需要明确设置 CHECKERBOARD=(cols, rows)")
     expected_corners = int(pattern[0] * pattern[1])
-    pairs = load_image_pairs()
+    pairs = load_image_pairs(rgb_dir, ir_dir)
     if not pairs:
         raise RuntimeError("未找到标定图像")
 
     print("=" * 72)
     print(f"RGB-IR global calibration | checkerboard={pattern} | pairs={len(pairs)}")
     print("=" * 72)
-    corners_dir = os.path.join(SAVE_PATH, "corners")
+    corners_dir = os.path.join(model_output_dir, "corners")
     os.makedirs(corners_dir, exist_ok=True)
     detected, records = [], []
 
@@ -374,13 +414,13 @@ def main():
             record["rejection_reasons"].append("image read failed")
             records.append(record)
             continue
-        ir = rotate_calibration_ir(ir_raw)
+        ir = rotate_calibration_ir(ir_raw, ir_rotation)
         try:
             _validate_reference_size(
-                (rgb.shape[1], rgb.shape[0]), CALIBRATION_RGB_REFERENCE_SIZE, "RGB"
+                (rgb.shape[1], rgb.shape[0]), rgb_reference_size, "RGB"
             )
             _validate_reference_size(
-                (ir.shape[1], ir.shape[0]), CALIBRATION_IR_REFERENCE_SIZE, "rotated IR"
+                (ir.shape[1], ir.shape[0]), ir_reference_size, "rotated IR"
             )
         except ValueError as error:
             record["rejection_reasons"].append(str(error))
@@ -454,19 +494,29 @@ def main():
     global_metrics = _global_metrics(global_H, accepted)
     loocv = _leave_one_out(accepted)
     selected_index, median_spread, max_spread = select_medoid(
-        accepted, CALIBRATION_IR_REFERENCE_SIZE, reference_H=global_H
+        accepted, ir_reference_size, reference_H=global_H
     )
     chosen = accepted[selected_index]
     projection = _projection_consistency(
-        accepted, global_H, CALIBRATION_IR_REFERENCE_SIZE
+        accepted, global_H, ir_reference_size
     )
-    global_passed = bool(
-        len(accepted) >= MIN_VALID_PAIRS
-        and global_metrics["rmse_px"] <= GLOBAL_MAX_RMSE_PX
+    geometry_passed = bool(
+        global_metrics["rmse_px"] <= GLOBAL_MAX_RMSE_PX
         and global_metrics["p95_error_px"] <= GLOBAL_MAX_P95_PX
         and global_metrics["max_error_px"] <= GLOBAL_MAX_ERROR_PX
         and loocv["passed"]
     )
+    sample_count_passed = len(accepted) >= formal_minimum
+    eligible_for_application = len(accepted) >= provisional_minimum
+    diversity = _diversity_metrics(accepted, rgb_reference_size)
+    if not eligible_for_application:
+        quality_status = "failed"
+    elif diversity["warning"] or not geometry_passed:
+        quality_status = "provisional_warning"
+    elif sample_count_passed:
+        quality_status = "formal"
+    else:
+        quality_status = "provisional"
 
     serialized_pairs = []
     for item in records:
@@ -507,9 +557,9 @@ def main():
             "rejected_pairs": [
                 item["name"] for item in records if not item.get("accepted", False)
             ],
-            "rgb_reference_size": list(CALIBRATION_RGB_REFERENCE_SIZE),
-            "ir_reference_size": list(CALIBRATION_IR_REFERENCE_SIZE),
-            "ir_rotation": CALIBRATION_IR_ROTATION,
+            "rgb_reference_size": list(rgb_reference_size),
+            "ir_reference_size": list(ir_reference_size),
+            "ir_rotation": ir_rotation,
             "model_point_count": len(accepted) * expected_corners,
             "coordinate_convention": {
                 "size_order": "width_height",
@@ -528,8 +578,14 @@ def main():
             "inlier_ratio": 1.0,
             "consistency_median_spread_px": median_spread,
             "consistency_max_spread_px": max_spread,
-            "consistent": global_passed,
-            "quality": "Good" if global_passed else "Needs review",
+            "consistent": geometry_passed,
+            "quality": "Good" if geometry_passed else "Needs review",
+            "geometry_passed": geometry_passed,
+            "sample_count_passed": sample_count_passed,
+            "diversity_warning": diversity["warning"],
+            "eligible_for_application": eligible_for_application,
+            "quality_status": quality_status,
+            "diversity": diversity,
             "model_type": "global_homography_all_accepted_corners_least_squares",
             "model_point_count": len(accepted) * expected_corners,
             "global_rmse_px": global_metrics["rmse_px"],
@@ -544,7 +600,10 @@ def main():
                 "global_p95_px": GLOBAL_MAX_P95_PX,
                 "global_max_px": GLOBAL_MAX_ERROR_PX,
                 "loocv_worst_rmse_px": LOOCV_MAX_RMSE_PX,
-                "minimum_valid_pairs": MIN_VALID_PAIRS,
+                "minimum_valid_pairs": formal_minimum,
+                "minimum_provisional_valid_pairs": provisional_minimum,
+                "base_short_edge_px": CALIBRATION_THRESHOLD_BASE_SHORT_EDGE,
+                "scale": CALIBRATION_THRESHOLD_SCALE,
             },
             "leave_one_out": loocv,
             "projection_consistency": projection,
@@ -556,8 +615,8 @@ def main():
             "camera-baseline disparity cannot be removed by one Homography",
         ],
     }
-    os.makedirs(SAVE_PATH, exist_ok=True)
-    yaml_path = os.path.join(SAVE_PATH, "calibration.yaml")
+    os.makedirs(model_output_dir, exist_ok=True)
+    yaml_path = os.path.join(model_output_dir, "calibration.yaml")
     with open(yaml_path, "w", encoding="utf-8") as stream:
         yaml.safe_dump(document, stream, allow_unicode=True, sort_keys=False)
 
@@ -573,6 +632,24 @@ def main():
     print(f"Representative pair: {chosen['name']} (diagnostic only)")
     print(f"Quality: {document['calibration']['quality']}")
     print(f"Saved: {yaml_path}")
+    report_path = os.path.join(model_output_dir, "calibration_report.yaml")
+    with open(report_path, "w", encoding="utf-8") as stream:
+        yaml.safe_dump({
+            "metadata": document["metadata"],
+            "quality": {
+                key: document["calibration"][key] for key in (
+                    "geometry_passed", "sample_count_passed",
+                    "diversity_warning", "eligible_for_application",
+                    "quality_status", "global_rmse_px", "global_p95_error_px",
+                    "global_max_error_px", "leave_one_out", "diversity",
+                )
+            },
+        }, stream, allow_unicode=True, sort_keys=False)
+    return document
+
+
+def main():
+    return calibrate_group(RGB_PATH, IR_PATH, SAVE_PATH)
 
 
 if __name__ == "__main__":
