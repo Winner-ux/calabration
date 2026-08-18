@@ -430,6 +430,8 @@ class DataPipelineTests(unittest.TestCase):
         self.assertFalse((output / "best.pt").exists())
         smoke = json.loads((output / "smoke_result.json").read_text(encoding="utf-8"))
         self.assertEqual(smoke["loss_weights"], DEFAULT_LOSS_WEIGHTS)
+        self.assertGreater(smoke["train_grad_norm_mean"], 0.0)
+        self.assertGreaterEqual(smoke["train_grad_norm_max"], smoke["train_grad_norm_mean"])
 
     def test_audit_detects_cross_split_exact_duplicate_and_source_fingerprint(self) -> None:
         modified_samples = [dict(row) for row in self.samples]

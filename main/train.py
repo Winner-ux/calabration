@@ -312,7 +312,13 @@ def run_training(args: argparse.Namespace) -> Path:
         lambda_ssim=loss_weights["ssim"],
         lambda_edge=loss_weights["edge"],
     ).to(device)
-    learning_rate = float(args.learning_rate or config["training"]["learning_rate"])
+    learning_rate = float(
+        args.learning_rate
+        if args.learning_rate is not None
+        else config["training"]["learning_rate"]
+    )
+    if not math.isfinite(learning_rate) or learning_rate <= 0:
+        raise DataContractError("learning_rate 必须是有限正数")
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     amp_enabled = bool(config["training"].get("amp", True)) and device.type == "cuda" and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -418,6 +424,11 @@ def run_training(args: argparse.Namespace) -> Path:
             "edge_loss": 0.0,
         }
         epoch_count = 0
+        grad_norm_count = 0
+        grad_norm_sum = 0.0
+        grad_norm_square_sum = 0.0
+        grad_norm_max = 0.0
+        amp_skipped_steps = 0
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         for batch in train_loader:
@@ -436,7 +447,21 @@ def run_training(args: argparse.Namespace) -> Path:
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            )
+            if not math.isfinite(grad_norm) and not amp_enabled:
+                raise FloatingPointError(
+                    f"训练梯度范数非有限值: grad_norm={grad_norm}, "
+                    f"samples={batch['sample_id']}"
+                )
+            if math.isfinite(grad_norm):
+                grad_norm_count += 1
+                grad_norm_sum += grad_norm
+                grad_norm_square_sum += grad_norm * grad_norm
+                grad_norm_max = max(grad_norm_max, grad_norm)
+            else:
+                amp_skipped_steps += 1
             scaler.step(optimizer)
             scaler.update()
             current_batch_size = vis.shape[0]
@@ -453,13 +478,47 @@ def run_training(args: argparse.Namespace) -> Path:
             name: value / epoch_count for name, value in epoch_totals.items()
         }
         train_loss = train_metrics["loss"]
+        grad_norm_mean = (
+            grad_norm_sum / grad_norm_count if grad_norm_count else None
+        )
+        grad_norm_variance = (
+            max(
+                0.0,
+                grad_norm_square_sum / grad_norm_count
+                - grad_norm_mean * grad_norm_mean,
+            )
+            if grad_norm_count and grad_norm_mean is not None
+            else None
+        )
+        grad_norm_std = (
+            math.sqrt(grad_norm_variance)
+            if grad_norm_variance is not None
+            else None
+        )
+        grad_norm_max_value = grad_norm_max if grad_norm_count else None
         if args.smoke_only:
             result = {
                 **run_metadata,
                 "steps": global_steps,
                 "train_loss": train_loss,
                 "output_shape": list(fused.shape),
+                "train_grad_norm_mean": grad_norm_mean,
+                "train_grad_norm_std": grad_norm_std,
+                "train_grad_norm_max": grad_norm_max_value,
+                "amp_skipped_steps": amp_skipped_steps,
+                "amp_skipped_step_fraction": amp_skipped_steps / global_steps,
             }
+            if device.type == "cuda":
+                result.update(
+                    {
+                        "peak_gpu_memory_bytes": int(
+                            torch.cuda.max_memory_allocated(device)
+                        ),
+                        "peak_gpu_memory_reserved_bytes": int(
+                            torch.cuda.max_memory_reserved(device)
+                        ),
+                    }
+                )
             (run_dir / "smoke_result.json").write_text(
                 json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
@@ -468,17 +527,28 @@ def run_training(args: argparse.Namespace) -> Path:
 
         val_metrics = _validate_epoch(model, criterion, val_loader, device, amp_enabled)
         val_loss = val_metrics["loss"]
+        epoch_seconds = time.perf_counter() - epoch_started
         log_row: dict[str, Any] = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
             **{f"train_{name}": train_metrics[name] for name in train_metrics if name != "loss"},
             **{f"val_{name}": val_metrics[name] for name in val_metrics if name != "loss"},
-            "epoch_seconds": time.perf_counter() - epoch_started,
+            "train_grad_norm_mean": grad_norm_mean,
+            "train_grad_norm_std": grad_norm_std,
+            "train_grad_norm_max": grad_norm_max_value,
+            "amp_skipped_steps": amp_skipped_steps,
+            "amp_skipped_step_fraction": amp_skipped_steps
+            / (grad_norm_count + amp_skipped_steps),
+            "samples_per_second": epoch_count / epoch_seconds,
+            "epoch_seconds": epoch_seconds,
             "elapsed_seconds": time.perf_counter() - training_started,
         }
         if device.type == "cuda":
             log_row["peak_gpu_memory_bytes"] = int(torch.cuda.max_memory_allocated(device))
+            log_row["peak_gpu_memory_reserved_bytes"] = int(
+                torch.cuda.max_memory_reserved(device)
+            )
         _append_log(run_dir / "metrics.csv", log_row)
         checkpoint = {
             "model": model.state_dict(),
