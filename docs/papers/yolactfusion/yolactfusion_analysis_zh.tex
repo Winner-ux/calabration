@@ -1,0 +1,381 @@
+% !TeX program = xelatex
+% !TeX root = yolactfusion_analysis_zh.tex
+% 独立中文文献分析稿；不修改现有论文。使用 XeLaTeX 编译两次。
+\documentclass[UTF8,a4paper,11pt,fontset=windows]{ctexart}
+\usepackage[margin=23mm,headheight=15pt]{geometry}
+\usepackage{amsmath,amssymb,booktabs,tabularx,array}
+\usepackage{graphicx,xcolor,tikz,tcolorbox}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=teal!65!black,urlcolor=teal!65!black,citecolor=teal!65!black,
+  pdftitle={YOLACTFusion 中文重点分析},pdfauthor={文献学习与项目分析}}
+\definecolor{ink}{HTML}{16364A}
+\definecolor{accent}{HTML}{167D8D}
+\definecolor{pale}{HTML}{EDF6F7}
+\definecolor{warm}{HTML}{FFF5E8}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{3pt}
+\renewcommand{\arraystretch}{1.28}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\AtBeginEnvironment{itemize}{\setlength{\itemsep}{3pt}\setlength{\parskip}{0pt}}
+\AtBeginEnvironment{enumerate}{\setlength{\itemsep}{3pt}\setlength{\parskip}{0pt}}
+\ctexset{section={format=\Large\bfseries\color{ink}},subsection={format=\large\bfseries\color{ink}}}
+\pagestyle{plain}
+\newtcolorbox{note}[1]{colback=pale,colframe=accent!50,boxrule=0.45pt,arc=1mm,
+  left=3mm,right=3mm,top=2mm,bottom=2mm,title={#1},fonttitle=\bfseries,coltitle=ink,colbacktitle=pale}
+\newtcolorbox{boundary}[1]{colback=warm,colframe=orange!45!black,boxrule=0.4pt,arc=1mm,
+  left=3mm,right=3mm,top=2mm,bottom=2mm,title={#1},fonttitle=\bfseries,coltitle=ink,colbacktitle=warm}
+\tikzset{box/.style={draw=accent!65,fill=pale,rounded corners=2pt,align=center,
+  text width=4.6cm,minimum height=1.0cm,font=\small,inner sep=5pt},
+  neutral/.style={box,draw=black!40,fill=black!3},
+  arr/.style={-{Latex[length=2.2mm]},line width=0.7pt,draw=ink}}
+\newcommand{\sourcepaper}{\href{https://doi.org/10.1016/j.compag.2023.108186}{YOLACTFusion 原文}}
+\newcommand{\coderef}[2]{\href{https://github.com/Winner-ux/calabration/blob/c61447127faea3625eec9a17ff841c7b249a8d59/#1}{#2}}
+\newcommand{\newpagepart}{\clearpage}
+\begin{document}
+
+\begin{center}
+  {\small\color{accent} COMPUTERS AND ELECTRONICS IN AGRICULTURE · 文献学习}\par
+  \vspace{6mm}
+  {\LARGE\bfseries\color{ink} YOLACTFusion 中文重点分析}\par
+  \vspace{3mm}
+  {\large 从近红外成像依据到任务导向融合}\par
+  \vspace{2mm}
+  {\normalsize 兼论对现有 RGB/IR 鱼类图像融合项目的启示}
+\end{center}
+\vspace{3mm}
+
+\noindent\textbf{论文：}Cheng Liu, Qingchun Feng, Yuhuan Sun, Yajun Li, Mengfei Ru, Lijia Xu.
+\emph{YOLACTFusion: An instance segmentation method for RGB-NIR multimodal image fusion based on an attention mechanism}.
+2023, 213:108186. \href{https://doi.org/10.1016/j.compag.2023.108186}{DOI: 10.1016/j.compag.2023.108186}.
+
+\section{阅读结论与证据范围}
+\begin{note}{先抓住方法的核心}
+这篇论文值得学习的主线是：为一个明确的目标识别困难选择辅助观测，再让融合特征接受最终任务监督。对现有项目而言，最有价值的问题不是“能否搭建双编码器”，而是“第二模态提供了什么可验证的信息，以及这些信息有没有真正进入识别决策”。
+\end{note}
+
+\subsection{已确认的论文信息}
+论文针对同色背景中的番茄主茎实例分割，使用 RGB 与 900--1100 nm NIR、双路 ResNet50 和多层并行注意力融合；损失结合 RGB 任务项与 NIR 定位、分类项；并采用局部深度可分离卷积及 Conv--BN 合并降低开销\cite{liu2023}。
+
+\subsection{本稿如何区分事实与推导}
+\noindent\begin{tabularx}{\linewidth}{@{}L{2.3cm}Y@{}}
+\toprule
+信息类型 & 使用边界\\
+\midrule
+原文已确认 & 来自出版商摘要、Highlights 和公开引言片段；结果数值单列在第\ref{sec:results}节。\\
+基础机制 & 原始 YOLACT 的掩码组合原理，明确引自 Bolya 等，而非声称逐层复原了 YOLACTFusion。\\
+独立分析 & 数学解释、物理适用条件、源码对比和建议实验；不作为原作者已验证结论。\\
+\bottomrule
+\end{tabularx}
+
+\begin{boundary}{全文证据边界}
+本次未取得完整论文 PDF。输入尺寸、融合层精确位置、注意力内部算子、各项损失权重、数据划分、全部消融表与计时条件仍待全文核实。图示为依据可确认信息绘制的概念图，不是原论文图的复刻。本稿也不是论文逐段翻译或已完成的复现报告。
+\end{boundary}
+
+\noindent\textbf{阅读路线：}概念架构（第2节）$\rightarrow$基础原理与损失（第3节）$\rightarrow$结果解读（第4节）$\rightarrow$物理前提（第5节）$\rightarrow$源码对照（第6节）$\rightarrow$验证方案（第7节）。
+
+\newpagepart
+\section{架构：明确主干，不补造内部细节}
+\begin{center}
+\begin{tikzpicture}
+  \node[box] (r) at (-3.3,0) {RGB 图像};
+  \node[box] (n) at (3.3,0) {NIR 图像};
+  \node[box] (er) at (-3.3,-1.5) {RGB 编码分支};
+  \node[box] (en) at (3.3,-1.5) {NIR 编码分支};
+  \node[box,text width=8.5cm] (f) at (0,-3.2) {同层级特征的多层融合\par 并行注意力的精确内部结构：待全文核对};
+  \node[box,text width=8.5cm] (h) at (0,-5.0) {任务预测部分\par 以 YOLACT 实例分割框架为基础};
+  \node[neutral,text width=8.5cm] (o) at (0,-6.5) {实例级预测\par 目标类别、位置与分割结果};
+  \draw[arr] (r)--(er); \draw[arr] (n)--(en);
+  \draw[arr] (er.south)--++(0,-0.35)-|(f.north west);
+  \draw[arr] (en.south)--++(0,-0.35)-|(f.north east);
+  \draw[arr] (f)--(h); \draw[arr] (h)--(o);
+\end{tikzpicture}
+\end{center}
+\noindent{\small\textbf{图1：}高层信息流示意。只表达双路编码、多层融合与任务输出的关系；不指定未知的通道数、步长、特征金字塔层数或分支监督连接。依据\cite{liu2023}整理。}
+
+\subsection{双路编码的合理性与代价}
+\textbf{独立分析：}不同传感器的强度分布、噪声和纹理响应可能不同。分开编码允许两路各自适应输入统计，再在更抽象的表征上交互。代价是参数与计算增多；如果独立训练样本不足，也可能更容易记住采集条件。因此，“双路优于单路”应通过任务实验判断，而不是由结构直接推出。
+
+\subsection{为什么“多层”不等于“每层都有贡献”}
+浅层通常保留较强的位置和局部纹理线索，较深层具有更大感受野。不同层融合有不同意义，但也可能冗余。应分别比较浅层、中层、深层及其组合；不能仅展示一张多层结构图，就认定每层都有必要。
+
+\subsection{不要把并行注意力直接写成全局交叉注意力}
+“注意力”可能指通道重加权、空间重加权、门控或 token 间交互。仅凭摘要，无法确定该文是否构造 $N\times N$ 关系矩阵，更不能给它套用本项目的 $Q/K/V$ 公式。复现前至少核实：权重生成方式、共享关系、融合操作、残差路径及注意力施加位置。
+
+\newpagepart
+\section{从 YOLACT 基础机制理解任务监督}
+\subsection{原型掩码与实例系数：基础模型，不是本文精确复原}
+原始 YOLACT 将掩码预测分解为图像级原型与实例级组合系数，再线性组合形成实例掩码\cite{bolya2019}。设原型矩阵为 $P\in\mathbb{R}^{hw\times k}$，实例系数为 $C\in\mathbb{R}^{n\times k}$，可用下式理解：
+\begin{equation}
+  \widetilde M=\sigma(PC^{\mathsf T}),\qquad
+  \widetilde M\in\mathbb{R}^{hw\times n}.
+\end{equation}
+这里 $k$ 是原型数量，$n$ 是候选实例数，$\sigma$ 为 sigmoid；之后结合目标框裁剪与筛选得到实例结果。本稿不指定 YOLACTFusion 实际采用的 $k,h,w$ 或筛选参数。
+
+\begin{center}
+\begin{tikzpicture}
+  \node[neutral,text width=6cm] (feat) at (0,0) {基础 YOLACT 特征};
+  \node[box,text width=4.7cm] (proto) at (-3.2,-1.6) {原型分支\par $P$：图像级掩码基底};
+  \node[box,text width=4.7cm] (coef) at (3.2,-1.6) {实例预测分支\par 类别、框与组合系数 $C$};
+  \node[box,text width=7cm] (mask) at (0,-3.3) {原型与系数组合\par 掩码生成、裁剪及实例筛选};
+  \draw[arr] (feat.south)--++(0,-0.3)-|(proto.north);
+  \draw[arr] (feat.south)--++(0,-0.3)-|(coef.north);
+  \draw[arr] (proto.south)|-(mask.west);
+  \draw[arr] (coef.south)|-(mask.east);
+\end{tikzpicture}
+\end{center}
+\noindent{\small\textbf{图2：}基础 YOLACT 的解释性简图，依据\cite{bolya2019}；不能据此确定 YOLACTFusion 的全部头部实现。}
+
+\subsection{用抽象算子表示尚未公开核实的融合模块}
+\begin{equation}
+  V_s=E_s^{\mathrm{RGB}}(I_R),\quad
+  N_s=E_s^{\mathrm{NIR}}(I_N),\quad
+  F_s=\mathcal F_s(V_s,N_s),\quad
+  \widehat y=\mathcal H(\{F_s\}).
+\end{equation}
+这是分析用记号，不是原文方程。保留 $\mathcal F_s$ 为待核实模块，比擅自填入一种熟悉的注意力机制更准确。关键问题是：来自最终任务的误差能否通过 $\mathcal H$ 和 $\mathcal F_s$ 更新两路特征。
+
+\subsection{损失的目的：让互补信息服务于目标}
+根据第1节的已确认损失组成，可以用\emph{非原文、仅表意}的形式写为：
+\begin{equation}
+  \mathcal L_{\mathrm{schematic}}
+  =\mathcal L_{\mathrm{RGB\ task}}
+   +\lambda_{\mathrm{loc}}\mathcal L_{\mathrm{NIR\ loc}}
+   +\lambda_{\mathrm{cls}}\mathcal L_{\mathrm{NIR\ cls}}.
+\end{equation}
+这里不能自行填入系数、匹配规则或监督层。独立分析认为，辅助任务约束可能帮助保持第二模态的任务相关表征；但若标注映射有误，也可能产生冲突梯度。应检查分支梯度、任务损失的权衡以及辅助项的独立消融。
+
+\newpagepart
+\section{报告结果：怎样正确解读增益}\label{sec:results}
+\noindent 表中数字均为原文摘要报告\cite{liu2023}，不是本项目的结果，也不是本稿复现实验。
+\begin{center}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\linewidth}{@{}Yrr@{}}
+\toprule
+指标 & YOLACT & YOLACTFusion\\
+\midrule
+摘要所报 mAP（\%） & 39.20 & 46.29\\
+模型文件大小（MB） & 199.03 & 165.52\\
+主茎检测 precision（\%） & 未列出 & 93.90\\
+主茎检测 recall（\%） & 未列出 & 62.60\\
+实例分割 precision（\%） & 未列出 & 95.12\\
+实例分割 recall（\%） & 未列出 & 63.41\\
+\bottomrule
+\end{tabularx}
+\end{center}
+\noindent\small “未列出”指当前可获取摘要未给出该基线数值，不代表完整论文没有报告。mAP 的具体任务口径、IoU 阈值集合及统计规则仍需全文确认。\normalsize
+
+\subsection{百分点、相对变化与物理量不能混用}
+由已报告数值计算：
+\begin{align}
+  \Delta\mathrm{mAP}&=7.09\text{ 个百分点},&
+  r_{\mathrm{mAP}}&=\frac{7.09}{39.20}\times100\%\approx18.09\%,\\
+  \Delta S&=33.51\ \mathrm{MB},&
+  r_S&=\frac{33.51}{199.03}\times100\%\approx16.84\%.
+\end{align}
+“提高7.09个百分点”与“相对提高约18.09\%”不是同一个表述。文件大小也不是峰值显存、参数量、FLOPs 或推理延迟；序列化方式和数值精度都会影响文件大小。
+
+\subsection{高 precision 与较低 recall 的共同含义}
+\textbf{独立分析：}在给定评价设置下，precision 较高表示输出预测的正确比例较高，而 recall 较低提示仍有漏检。需要检查失败是否集中于遮挡、细茎或弱对比度区域；汇总数字不能说明具体失败分布。
+
+\subsection{这些数字尚不能回答什么}
+\begin{itemize}
+  \item \textbf{因果归因：}同时改变输入、融合、损失与轻量化结构时，总体增益不能全部归功于注意力。
+  \item \textbf{统计稳定性：}没有种子、独立样本数和区间估计，不能判断小幅差异的稳定程度。
+  \item \textbf{跨域能力：}同域测试不等于换温室、设备、季节或目标种类仍然有效。
+  \item \textbf{实时部署：}需要输入尺寸、硬件、batch、精度模式和端到端计时边界。
+\end{itemize}
+\noindent\textbf{评价习惯：}同时报告准确性、漏检、成本和失败条件。上述问题属于待核实清单，不是断言原论文没有相应实验。
+
+\newpagepart
+\section{物理视角：可借鉴的是原则，不是照搬结论}
+\subsection{反射成像的解释模型}
+对于常见的近红外反射成像，可用下面的简化观测关系思考：
+\begin{equation}
+ I_m(u)\approx g_m\!\left(\int S_m(\lambda)E(\lambda,X)
+ \rho(\lambda,X)T_m(\lambda,X)\,\mathrm d\lambda\right)+n_m(u).
+\end{equation}
+其中 $S_m$ 为传感器及滤光片响应，$E$ 为目标处照明，$\rho$ 为反射特性，$T_m$ 表示到相机的传播与光学传输，$g_m$ 包含曝光、增益及响应，$n_m$ 为噪声。此式是本稿用于解释的简化模型，未显式建模所有散射、镜面反射与折射效应。
+
+近红外反射信号与热红外辐射不能混为一谈\cite{nasa}。因此，一路图像变亮，既可能是目标反射发生变化，也可能只是曝光、照明或距离变化。将数字值归一化到 $[0,1]$，并没有消除这些混杂因素。
+
+\subsection{用“可分性”而不是“亮度更大”评价第二模态}
+\textbf{建议的先验诊断：}在可信标注和固定采集条件下，比较目标与背景的分布差异，例如
+\begin{equation}
+ d_m=\frac{|\mu_{m,\mathrm{target}}-\mu_{m,\mathrm{background}}|}
+ {\sqrt{(\sigma^2_{m,\mathrm{target}}+\sigma^2_{m,\mathrm{background}})/2+\varepsilon}}.
+\end{equation}
+这是用于筛查的标准化均值差，不是原文指标，也不是完整的可识别性度量。应按采集批次分组比较，而非把所有相关像素当成独立样本；即使 $d_m$ 较大，仍需验证结构、纹理和最终任务表现。
+
+\subsection{配准不确定性如何影响细结构}
+设两路残余位移为 $\delta(u)$，特征层步长为 $s$，则小位移在该层的量级约为 $\delta/s$。更粗的尺度可能缓和位置差异，但也会降低细结构的空间分辨率。应同时记录配准残差与目标宽度，而不能只比较平均像素误差。
+
+单应关系具有平面或特定相机运动前提\cite{opencv}。如果两台相机观察具有深度差的目标，不能假设标定板平面对齐后，所有目标表面都同样对齐；注意力也不自动等价于几何校正。
+
+\subsection{从温室迁移到水下，必须重新验证的条件}
+水下波段相关的直接信号衰减与后向散射，需要区别处理\cite{akkaynak2018}。这意味着温室里的波段优势不能直接证明水下鱼体病变具有同样优势。优先测量不同距离、水体、照明下的第二模态质量，再决定是否使用该模态。
+\begin{boundary}{物理合理性不等于物理约束}
+“因光谱差异而引入 NIR”是物理动机；只有显式引入可验证的观测关系、几何有效性或质量约束，并通过实验验证，才能进一步讨论相应约束是否成立。注意力热图本身不是物理因果解释。
+\end{boundary}
+
+\newpagepart
+\section{与现有 GitHub 模型的对应和区别}
+\noindent 对照对象限定为 \texttt{Winner-ux/calabration} 的提交
+\href{https://github.com/Winner-ux/calabration/tree/c61447127faea3625eec9a17ff841c7b249a8d59}{\texttt{c614471}}，不混用本地后续门控版本\cite{repo}。
+
+\noindent\begin{tabularx}{\linewidth}{@{}L{2.1cm}YY@{}}
+\toprule
+维度 & YOLACTFusion（可确认层面） & 当前固定版本（源码核对）\\
+\midrule
+输出目标 & 实例级任务结果 & 一张三通道融合图\\
+特征交互 & 多层并行注意力；内部算子待核实 & RGB 查询 IR 的单头全局交叉注意力\\
+优化方向 & 任务相关监督 & 强度、梯度、SSIM、边缘重建损失\\
+空间重建 & 精确头部连接待核实 & 转置卷积解码，接收 F2--F5\\
+第二模态价值 & 通过下游实例任务评价 & 尚需连接分类、检测或分割评价\\
+\bottomrule
+\end{tabularx}
+
+\subsection{本项目的交叉注意力可以精确写出}
+以下公式属于本项目，不属于 YOLACTFusion。省略投影偏置后：
+\begin{equation}
+ A=\operatorname{softmax}\!\left(\frac{(X_RW_Q)(X_IW_K)^{\mathsf T}}{\sqrt C}\right),
+ \qquad Z=X_R+A(X_IW_V).
+\end{equation}
+然后将原始两路特征与 $Z$ 拼接，再经 $1\times1$ 卷积、BN 和 ReLU。
+见\coderef{model/attention.py\#L161}{attention.py}及\coderef{model/fusion_net.py\#L65}{fusion\_net.py}。
+
+\subsection{三个应独立处理的实现问题}
+\begin{enumerate}
+  \item \textbf{无效融合分支：}代码计算 F1，但解码器只消费 F2--F5，F1 不进入最终输出路径。应在隔离副本中验证跳过 F1 后输出一致。不能因此删除编码器第一层。
+  \item \textbf{浅层全局矩阵成本：}若输入为 $448\times448$，浅层为 $112\times112$，则单张注意力矩阵有 $12544^2=157351936$ 个元素；FP32 解析存储量为600.25 MiB，不含其他激活和梯度。这不是实测峰值显存。
+  \item \textbf{目标与任务脱节：}逐通道 $\max(I_R,I_I)$ 会把较亮 IR 推入所有颜色通道；全局均值 SSIM 后取最大值，也不是逐区域择优。它们不能直接保证疾病相关信息被保留。
+\end{enumerate}
+\noindent 证据：\coderef{model/decoder.py\#L140}{decoder.py 的特征索引}、
+\coderef{main/loss.py\#L367}{强度目标}、\coderef{main/loss.py\#L431}{SSIM 选择}。
+
+\begin{note}{对照后的主要启示}
+真正需要向该文学习的是“融合服务于目标任务”的组织方式。现有网络输出融合图，与直接预测实例不是同一个优化问题；即使两者都使用双路编码，也不能据此认定方法相同或性能可直接比较。
+\end{note}
+
+\newpagepart
+\section{把阅读结论变成可否证的实验}
+\noindent 下表为针对现有项目提出的实验，不是 YOLACTFusion 已报告的消融。
+
+\begingroup\small\renewcommand{\arraystretch}{1.15}
+\noindent\begin{tabularx}{\linewidth}{@{}L{2.2cm}YY@{}}
+\toprule
+研究问题 & 单因素对照 & 保留或否证判据\\
+\midrule
+模态必要性 & RGB-only、IR-only、RGB+IR；统一数据划分和任务头 & 若跨独立组没有稳定增益，应先改善采集或重新定位模态作用。\\
+融合复杂度 & 拼接卷积、局部门控、全局注意力 & 比较任务表现、延迟和显存；复杂模块必须有可解释的额外收益。\\
+融合位置 & 浅层、中层、深层及有限组合 & 若某层无增益且增大成本，应考虑删除，而不是保留所有尺度。\\
+配准鲁棒性 & IR 已知小位移与真实残余错位 & 检查随误差增大的性能曲线，以及双轮廓、漏检和细结构损失。\\
+质量退化 & 模糊、低信号、饱和、遮挡分别施加 & 辅助模态失效时是否优于或接近 RGB 基线；正常条件下是否过度抑制 IR。\\
+监督作用 & 固定结构，仅改变任务损失与辅助损失 & 分析分支梯度、目标召回和泛化；不能以训练损失降低代替任务改善。\\
+\bottomrule
+\end{tabularx}
+\endgroup
+
+\subsection{最小执行顺序}
+\begin{enumerate}
+  \item \textbf{先确认标签粒度：}图像级标签只支持相应分类；框标签支持检测；实例掩码才能直接验证实例分割。不能从实验组名称自动生成病斑真值。
+  \item \textbf{固定评估单元：}按鱼体、实验或采集事件分组，相关视频帧不跨集合。验证集用于选择方法，测试集不参与反复调参。
+  \item \textbf{先建简单基线：}保持训练预算、初始化策略和任务头一致，再检验多模态及融合结构的增量价值。必要时补充容量匹配基线。
+  \item \textbf{最后做鲁棒性：}先在验证集定义退化范围，再在持出条件评估。人工噪声不能代替真实设备退化。
+\end{enumerate}
+
+\subsection{评价时避免三个误判}
+\begin{itemize}
+  \item 第二模态被打乱后掉分，只说明模型对输入干预敏感，不能单独证明它使用了正确的对应信息；需要与单模态及缺失模态训练对照结合。
+  \item 更多视频帧不等于更多独立鱼体。置信区间应尊重分组结构，而不是把相关帧当成独立样本。
+  \item 注意力集中在目标附近是可视化证据，不是因果证明；应结合遮挡、替换、错配和背景控制实验。
+\end{itemize}
+
+\noindent\textbf{优先级：}先检查观测和标签，再验证模态及结构。无效 F1 的清理属于工程修正，不宜作为核心学术创新。
+
+\newpagepart
+\section{迁移到鱼类研究：两条路线，不混写任务}
+\begin{center}
+\begin{tikzpicture}
+  \node[neutral,text width=8cm] (in) at (0,0) {已质控并配准的 RGB/IR 输入};
+  \node[box,text width=4.9cm] (img) at (-3.2,-1.7) {路线 A：图像级融合\par 编码、融合、图像解码};
+  \node[box,text width=4.9cm] (fea) at (3.2,-1.7) {路线 B：任务特征融合\par 双路特征直接交互};
+  \node[neutral,text width=4.9cm] (imghead) at (-3.2,-3.5) {融合图输入固定任务模型\par 评价图像与任务表现};
+  \node[neutral,text width=4.9cm] (feahead) at (3.2,-3.5) {融合特征输入任务头\par 直接由任务误差优化};
+  \node[box,text width=9cm] (ev) at (0,-5.3) {共同评估：独立组泛化、模态必要性、鲁棒性、成本\par 分类 / 检测 / 实例分割由真实标签决定};
+  \draw[arr] (in.south)--++(0,-0.4)-|(img.north);
+  \draw[arr] (in.south)--++(0,-0.4)-|(fea.north);
+  \draw[arr] (img)--(imghead); \draw[arr] (fea)--(feahead);
+  \draw[arr] (imghead.south)--++(0,-0.35)-|(ev.north west);
+  \draw[arr] (feahead.south)--++(0,-0.35)-|(ev.north east);
+\end{tikzpicture}
+\end{center}
+\noindent{\small\textbf{图3：}本稿提出的迁移路线。不是原论文架构，也不是已实施的模型。}
+
+\subsection{路线 A：保留现有重建模型}
+优点是可以直接观察融合图，并接入常规 RGB 任务模型。风险是重建损失可能偏好视觉增强而非任务相关信息。需公平比较“原始 RGB 输入”与“融合图输入”的相同任务模型；不能同时更换检测器、数据划分和训练预算。
+
+\subsection{路线 B：直接面向任务融合}
+对检测或分割而言，可以让两路特征在任务网络内交互，减少先压缩成三通道图像的约束。代价是需要相应粒度的标签与更多训练验证。只有分类标签时，应先采用分类头，不应把病斑定位或分割写成现成能力。
+
+\subsection{适合形成论文的问题表述}
+\begin{note}{候选研究问题，而非成果声明}
+在明确的 RGB/IR 成像条件与跨实验评估下，局部几何有效性和模态质量控制，能否以较低的交互成本提高鱼类异常识别，并在辅助模态退化时保持稳定？
+\end{note}
+写作时可以围绕“观测依据、数据与标签、融合设计、任务验证”组织。当前应避免写“首次使用双编码器”“注意力自动解决配准”“NIR 必然揭示病变”或“已提升泛化能力”。这些主张分别需要文献、几何、成像或独立测试证据。
+
+\newpagepart
+\section{取得全文后的精读与复现核对清单}
+\noindent\begin{tabularx}{\linewidth}{@{}L{2.8cm}Y@{}}
+\toprule
+原文位置 & 要记录的具体信息\\
+\midrule
+采集与数据 & 相机、滤光片、照明、曝光、距离、同步与配准方法；图像数、实例数、独立植株或场景数。\\
+标注与划分 & 类别定义、遮挡标注规则；训练验证测试是否按独立植株、日期或场景隔离。\\
+架构图和公式 & 每层尺寸、融合层位置、并行注意力的算子、分支共享关系、输出头与残差连接。\\
+损失与训练 & 辅助定位和分类监督施加位置、匹配规则、各项权重；预训练、增强、优化器及预算。\\
+消融与统计 & 增益是否可分别归因于模态、融合、损失和轻量化；是否有多次运行或区间估计。\\
+指标与效率 & mAP 的 IoU 与任务口径、precision/recall 阈值；硬件、输入分辨率、batch、精度模式和计时范围。\\
+失败与可复现性 & 弱光、遮挡、细结构等失败例；代码、权重、数据或实验配置是否公开。\\
+\bottomrule
+\end{tabularx}
+
+\begin{thebibliography}{9}
+\small
+\bibitem{liu2023}
+Liu C, Feng Q, Sun Y, Li Y, Ru M, Xu L.
+YOLACTFusion: An instance segmentation method for RGB-NIR multimodal image fusion based on an attention mechanism.
+\emph{Computers and Electronics in Agriculture}, 2023, 213:108186.
+\href{https://doi.org/10.1016/j.compag.2023.108186}{doi:10.1016/j.compag.2023.108186}.
+本稿采用出版商公开摘要、Highlights 与引言片段。
+
+\bibitem{bolya2019}
+Bolya D, Zhou C, Xiao F, Lee Y J.
+YOLACT: Real-Time Instance Segmentation.
+\emph{ICCV}, 2019:9157--9166.
+\href{https://openaccess.thecvf.com/content_ICCV_2019/html/Bolya_YOLACT_Real-Time_Instance_Segmentation_ICCV_2019_paper.html}{CVF 原始论文页面}。
+
+\bibitem{nasa}
+NASA Science. Reflected Near-Infrared Waves.
+\href{https://science.nasa.gov/ems/08_nearinfraredwaves/}{官方近红外反射成像说明}，访问：2026-08-31。
+
+\bibitem{akkaynak2018}
+Akkaynak D, Treibitz T. A Revised Underwater Image Formation Model.
+\emph{CVPR}, 2018:6723--6732.
+\href{https://openaccess.thecvf.com/content_cvpr_2018/html/Akkaynak_A_Revised_Underwater_CVPR_2018_paper.html}{CVF 原始论文页面}。
+
+\bibitem{opencv}
+OpenCV. Basic concepts of the homography explained with code.
+\href{https://docs.opencv.org/4.x/d9/dab/tutorial_homography.html}{官方单应变换教程}，访问：2026-08-31。
+
+\bibitem{repo}
+Winner-ux/calabration. 提交 \texttt{c614471}。
+\coderef{model/fusion_net.py}{融合网络}、
+\coderef{model/attention.py}{注意力}、
+\coderef{model/decoder.py}{解码器}、
+\coderef{main/loss.py}{损失函数}。
+第6节仅分析该固定提交，不代表本地工作区的后续版本。
+\end{thebibliography}
+
+\end{document}
